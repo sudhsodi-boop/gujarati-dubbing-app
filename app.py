@@ -14,9 +14,13 @@ from __future__ import annotations
 
 import os
 import shutil
+import sys
 import time
 import zipfile
 from pathlib import Path
+
+# make sure the script's own directory is importable (helps on cloud deploys)
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import pandas as pd
 import streamlit as st
@@ -96,6 +100,33 @@ with st.sidebar:
         tts_model = st.text_input("Gemini TTS model", tts.TTS_MODEL)
         max_chunk = st.slider("Max ASR chunk (seconds)", 45, 120, 75)
         show_cols = st.checkbox("Show per-segment audio player", value=False)
+
+
+# --- friendly key onboarding: paste keys right in the main window ---
+if not keys:
+    st.warning("🔑 **One step before we start** — add your free Gemini API key(s) below.")
+    pasted = st.text_area(
+        "Paste API key(s) here — one per line",
+        placeholder="AIzaSy....",
+        height=90,
+        key="main_key_input",
+    )
+    if pasted.strip():
+        keys.extend(load_keys_from_text(pasted))
+        st.success(f"✅ {len(keys)} key(s) loaded — you're ready!")
+    st.markdown(
+        """
+**How to get a free key (1 minute):**
+1. Open 👉 [aistudio.google.com/app/apikey](https://aistudio.google.com/app/apikey)
+2. Sign in with your Google account → **Create API key** → copy it
+3. Paste it in the box above (optional: create keys in new Google projects for more free quota — the app rotates them automatically)
+
+🔒 *Keys live only in your browser session — nothing is saved on any server.*
+"""
+    )
+    st.stop()
+else:
+    st.success(f"🔑 {len(keys)} API key(s) active")
 
 
 def rotator_or_stop():
