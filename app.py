@@ -183,6 +183,7 @@ if st.session_state.get("audio_wav"):
             st.session_state.segments = segs
             st.session_state.voiced = None
             bar.progress(1.0, text=f"Done — {len(segs)} segments")
+            st.success(f"✅ Transcription done ({len(segs)} segments) — review below, ⬇️ scroll down to Step 3. (Tip: don't click other buttons while a step's progress bar is running.)")
         except Exception as exc:
             st.exception(exc)
 
@@ -217,10 +218,12 @@ if st.session_state.get("segments"):
             st.session_state.segments = out
             st.session_state.voiced = None
             bar.progress(1.0, text="Translation done")
+            st.success("✅ Translation complete — right column below. ⬇️ Scroll down to Step 4. (No need to click Translate again — clicking a button while something runs restarts it.)")
         except Exception as exc:
             st.exception(exc)
 
     if any(s.get("translated") for s in st.session_state.segments):
+        st.caption("ℹ️ Left column = original Gujarati (reference — it stays Gujarati on purpose). Right column = translation; click any cell to edit it.")
         df = pd.DataFrame(st.session_state.segments)[["text", "translated"]]
         edited = st.data_editor(
             df, use_container_width=True,
@@ -239,26 +242,32 @@ if st.session_state.get("segments"):
 # ------------------------------------------------------------------ step 4
 if any(s.get("translated") for s in st.session_state.get("segments") or []):
     st.header("4️⃣ Generate dubbed audio")
+    st.caption("⏳ Voicing takes ~2–4 min for a 5-min video. While the bar moves, **don't click anything** — clicks restart the step. Just wait for 100%.")
     if st.button("🎙️ Voice & align all segments", type="primary"):
         run_dir = get_run_dir()
         rot = KeyRotator(keys) if keys else None
         bar = st.progress(0.0, text="Voicing…")
-        voiced = tts.synthesize_track(
-            st.session_state.segments,
-            run_dir / "voice_segments",
-            engine=engine, voice=voice, rotator=rot,
-            edge_fallback_voice=edge_fallback,
-            progress_cb=lambda p, m: bar.progress(p, text=m),
-        )
-        st.session_state.voiced = voiced
-        bar.progress(0.99, text="Assembling final track…")
-        track = align.build_track(
-            voiced, st.session_state.duration, run_dir / "dubbed.wav",
-            run_dir / "stretch_tmp",
-        )
-        st.session_state.track_wav = str(track)
-        st.session_state.dubbed_video = None
-        bar.progress(1.0, text="Dubbed audio ready 🎉")
+        try:
+            voiced = tts.synthesize_track(
+                st.session_state.segments,
+                run_dir / "voice_segments",
+                engine=engine, voice=voice, rotator=rot,
+                edge_fallback_voice=edge_fallback,
+                progress_cb=lambda p, m: bar.progress(p, text=m),
+            )
+            st.session_state.voiced = voiced
+            bar.progress(0.99, text="Assembling final track…")
+            track = align.build_track(
+                voiced, st.session_state.duration, run_dir / "dubbed.wav",
+                run_dir / "stretch_tmp",
+            )
+            st.session_state.track_wav = str(track)
+            st.session_state.dubbed_video = None
+            bar.progress(1.0, text="Dubbed audio ready 🎉")
+            st.success("✅ Dubbed audio ready! ⬇️ Scroll down to hear the preview, then Step 5.")
+        except Exception as exc:
+            st.exception(exc)
+            st.warning("💡 If the error mentions network / websocket / edge-tts: switch the **Voice engine** in the sidebar to the other option and click this button again, once.")
 
     if st.session_state.get("voiced"):
         voiced = st.session_state.voiced
@@ -333,5 +342,26 @@ if st.session_state.get("track_wav"):
                 "Lips don't move yet in the left video. To fix: open "
                 "**lipsync_colab.ipynb** (in this project folder) in Google Colab "
                 "with a free T4 GPU, upload this zip, and run all cells — "
-                "MuseTalk will re-animate the mouth to match the new audio."
+                "MuseTalk will re-animate the mouth to match the new audio. "
+                "*(Long videos: the notebook now auto-splits into chunks.)*"
+            )
+
+        st.divider()
+        st.subheader("📝 Optional: subtitled version (no Colab needed)")
+        st.caption("Skips lip-sync — burns the translated subtitles into the dubbed video instead. Good for long videos.")
+        if st.button("Create subtitled video"):
+            with st.spinner("Rendering subtitles (a few minutes per 15 min of video)…"):
+                subbed = videoutils.burn_subtitles(
+                    st.session_state.dubbed_video,
+                    get_run_dir() / "dub.srt",
+                    get_run_dir() / f"dubbed_{target_language.lower()}_subtitled.mp4",
+                )
+                st.session_state.subbed_video = str(subbed)
+        if st.session_state.get("subbed_video"):
+            st.video(st.session_state.subbed_video)
+            st.download_button(
+                "⬇️ Download subtitled video",
+                Path(st.session_state.subbed_video).read_bytes(),
+                file_name=f"dubbed_{target_language.lower()}_subtitled.mp4",
+                mime="video/mp4",
             )
