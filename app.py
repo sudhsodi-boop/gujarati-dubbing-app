@@ -136,6 +136,14 @@ def rotator_or_stop():
     return KeyRotator(keys)
 
 
+def _safe_editor(df, **kwargs):
+    """data_editor that works on both new (width='stretch') and older Streamlit."""
+    try:
+        return st.data_editor(df, width="stretch", **kwargs)
+    except TypeError:
+        return st.data_editor(df, use_container_width=True, **kwargs)
+
+
 # ------------------------------------------------------------------ step 1
 st.header("1️⃣ Upload Gujarati video")
 uploaded = st.file_uploader("Video file", type=["mp4", "mov", "mkv", "webm", "m4v"])
@@ -190,9 +198,12 @@ if st.session_state.get("audio_wav"):
     segs = st.session_state.get("segments")
     if segs:
         st.write("Review the Gujarati transcript — fixing misheard words here improves the whole dub:")
-        df = pd.DataFrame(segs)[["start", "end", "text"]]
-        edited = st.data_editor(
-            df, num_rows="dynamic", use_container_width=True,
+        df = pd.DataFrame(
+            [{"start": s.get("start", 0.0), "end": s.get("end", 0.0), "text": s.get("text", "")}
+             for s in segs]
+        )
+        edited = _safe_editor(
+            df, num_rows="dynamic",
             column_config={
                 "start": st.column_config.NumberColumn("Start (s)", format="%.2f", width="small"),
                 "end": st.column_config.NumberColumn("End (s)", format="%.2f", width="small"),
@@ -200,7 +211,17 @@ if st.session_state.get("audio_wav"):
             },
             key="transcript_editor",
         )
-        st.session_state.segments = edited.to_dict("records")
+        # merge edits IN PLACE so other fields (e.g. 'translated') survive refreshes
+        records = edited.to_dict("records")
+        current = list(st.session_state.segments)
+        out = []
+        for i, rec in enumerate(records):
+            row = dict(current[i]) if i < len(current) else {}
+            for k in ("start", "end", "text"):
+                if k in rec:
+                    row[k] = rec[k]
+            out.append(row)
+        st.session_state.segments = out
 
 # ------------------------------------------------------------------ step 3
 if st.session_state.get("segments"):
@@ -224,20 +245,24 @@ if st.session_state.get("segments"):
 
     if any(s.get("translated") for s in st.session_state.segments):
         st.caption("ℹ️ Left column = original Gujarati (reference — it stays Gujarati on purpose). Right column = translation; click any cell to edit it.")
-        df = pd.DataFrame(st.session_state.segments)[["text", "translated"]]
-        edited = st.data_editor(
-            df, use_container_width=True,
+        df = pd.DataFrame(
+            [{"text": s.get("text", ""), "translated": s.get("translated", "")}
+             for s in st.session_state.segments]
+        )
+        edited = _safe_editor(
+            df,
             column_config={
                 "text": st.column_config.TextColumn(f"Original ({source_language})", width="medium", disabled=True),
                 "translated": st.column_config.TextColumn(f"Translation ({target_language}) — editable", width="large"),
             },
             key="translation_editor",
         )
-        merged = []
-        for orig, row in zip(st.session_state.segments, edited.to_dict("records")):
-            orig["translated"] = row["translated"]
-            merged.append(orig)
-        st.session_state.segments = merged
+        # merge edits IN PLACE (defensive against refresh wiping other fields)
+        records = edited.to_dict("records")
+        segs = st.session_state.segments
+        for i, rec in enumerate(records):
+            if i < len(segs) and rec.get("translated") is not None:
+                segs[i]["translated"] = rec["translated"]
 
 # ------------------------------------------------------------------ step 4
 if any(s.get("translated") for s in st.session_state.get("segments") or []):
