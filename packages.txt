@@ -1,0 +1,3 @@
+# System packages installed via apt when deploying to
+# Streamlit Community Cloud or Hugging Face Spaces.
+ffmpeg
