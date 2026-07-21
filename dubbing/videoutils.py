@@ -63,6 +63,28 @@ def mux_audio_video(
     return Path(out_mp4)
 
 
+def burn_subtitles(
+    video_path: str | Path, srt_path: str | Path, out_mp4: str | Path
+) -> Path:
+    """Burn an SRT subtitle file into the video (re-encodes the video)."""
+    s = (
+        str(Path(srt_path).resolve())
+        .replace("\\", "/")
+        .replace(":", "\\:")
+        .replace("'", "\\'")
+    )
+    vf = f"subtitles='{s}':force_style='FontSize=16,Outline=1,Shadow=1'"
+    _run(
+        [
+            "ffmpeg", "-y", "-i", str(video_path),
+            "-vf", vf,
+            "-c:v", "libx264", "-preset", "veryfast", "-crf", "19",
+            "-c:a", "copy", str(out_mp4),
+        ]
+    )
+    return Path(out_mp4)
+
+
 def srt_timestamp(seconds: float) -> str:
     ms = int(round(seconds * 1000))
     h, ms = divmod(ms, 3_600_000)
