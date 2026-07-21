@@ -104,16 +104,16 @@ with st.sidebar:
 
 # --- friendly key onboarding: paste keys right in the main window ---
 if not keys:
-    st.warning("🔑 **One step before we start** — add your free Gemini API key(s) below.")
     pasted = st.text_area(
         "Paste API key(s) here — one per line",
         placeholder="AIzaSy....",
         height=90,
         key="main_key_input",
     )
-    if pasted.strip():
-        keys.extend(load_keys_from_text(pasted))
-        st.success(f"✅ {len(keys)} key(s) loaded — you're ready!")
+    keys.extend(load_keys_from_text(pasted))
+
+if not keys:
+    st.warning("🔑 **One step before we start** — add your free Gemini API key(s) above.")
     st.markdown(
         """
 **How to get a free key (1 minute):**
@@ -125,8 +125,8 @@ if not keys:
 """
     )
     st.stop()
-else:
-    st.success(f"🔑 {len(keys)} API key(s) active")
+
+st.success(f"🔑 {len(keys)} API key(s) active — let's dub!")
 
 
 def rotator_or_stop():
