@@ -140,8 +140,10 @@ def job_start(run_id: str, kind: str, fn: Callable[[Callable], Any]) -> None:
     def _cb(pct: float, msg: str):
         _write_status(run_id, kind, status="running", pct=float(pct), msg=msg)
 
+    # write the initial status SYNCHRONOUSLY (prevents UI poll race)
+    _write_status(run_id, kind, status="running", pct=0.0, msg="starting…")
+
     def _wrap():
-        _write_status(run_id, kind, status="running", pct=0.0, msg="starting…")
         try:
             result = fn(_cb)
             (_run_dir(run_id) / f"result_{kind}.json").write_text(
