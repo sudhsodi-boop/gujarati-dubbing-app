@@ -37,7 +37,7 @@ def probe_duration_s(path: str | Path) -> float:
 
 
 def extract_audio(video_path: str | Path, wav_path: str | Path, sr: int = 16000) -> Path:
-    """Mono 16 kHz WAV – ideal for ASR."""
+    """Mono 16 kHz WAV – ideal for ASR. Works for video AND audio inputs."""
     _run(
         [
             "ffmpeg", "-y", "-i", str(video_path), "-vn",
@@ -45,6 +45,10 @@ def extract_audio(video_path: str | Path, wav_path: str | Path, sr: int = 16000)
         ]
     )
     return Path(wav_path)
+
+
+def download_video_file(path: str | Path) -> bytes:
+    return Path(path).read_bytes()
 
 
 def mux_audio_video(

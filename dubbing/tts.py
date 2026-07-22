@@ -128,10 +128,15 @@ def synthesize_track(
     voice: str = "hi-IN-SwaraNeural",
     rotator: KeyRotator | None = None,
     edge_fallback_voice: str | None = None,
+    speaker_voices: dict[str, str] | None = None,  # {speaker: edge voice}
     auto_fallback_to_edge: bool = True,
     progress_cb=None,
 ) -> list[dict]:
-    """Synthesize every segment's `translated` text. Returns segments with 'wav'."""
+    """Synthesize every segment's `translated` text. Returns segments with 'wav'.
+
+    speaker_voices maps speaker labels (e.g. {"Pujyashree": ..., "Questioner": ...})
+    to Edge voices — used when engine == "edge" for two-voice dubbing.
+    """
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     gemini_dead = False
@@ -143,10 +148,16 @@ def synthesize_track(
             results.append({**seg, "wav": None, "engine": None})
             continue
 
+        # voice for this segment
+        if engine == "edge" and speaker_voices and seg.get("speaker") in speaker_voices:
+            seg_voice = speaker_voices[seg["speaker"]]
+        else:
+            seg_voice = voice
+
         done = False
         if engine == "gemini" and not gemini_dead:
             try:
-                synth_gemini(text, voice, rotator, wav_path)  # type: ignore[arg-type]
+                synth_gemini(text, seg_voice, rotator, wav_path)  # type: ignore[arg-type]
                 done = True
                 results.append({**seg, "wav": str(wav_path), "engine": "gemini"})
             except NoKeysAvailable:
@@ -154,7 +165,8 @@ def synthesize_track(
             except Exception:
                 gemini_dead = True  # unexpected TTS error → fall back, don't die
         if not done:
-            v = edge_fallback_voice or voice
+            # gemini-fallback uses the dedicated fallback voice; edge uses the user pick
+            v = edge_fallback_voice if engine == "gemini" else seg_voice
             synth_edge(text, v, wav_path)
             results.append({**seg, "wav": str(wav_path), "engine": "edge"})
 
