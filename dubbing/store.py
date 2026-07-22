@@ -95,6 +95,29 @@ def artifact(run_id: str, name: str) -> str | None:
     return str(p) if p.exists() else None
 
 
+# ------------------------------------------------------------------ flags
+def set_flag(run_id: str, name: str, value) -> None:
+    """Tiny JSON flag file used for job<->UI communication (ask/decide etc.)."""
+    p = _run_dir(run_id) / f"flag_{name}.json"
+    if value is None:
+        p.unlink(missing_ok=True)
+        return
+    try:
+        p.write_text(json.dumps({"v": value}), encoding="utf-8")
+    except Exception:
+        pass
+
+
+def get_flag(run_id: str, name: str, default=None):
+    p = _run_dir(run_id) / f"flag_{name}.json"
+    if p.exists():
+        try:
+            return json.loads(p.read_text(encoding="utf-8")).get("v", default)
+        except Exception:
+            pass
+    return default
+
+
 # ------------------------------------------------------------------ jobs
 def _status_path(run_id: str) -> Path:
     return _run_dir(run_id) / "job_status.json"

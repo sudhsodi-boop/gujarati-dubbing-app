@@ -10,7 +10,6 @@ Usage:
 
 from __future__ import annotations
 
-import itertools
 import threading
 import time
 from typing import Callable, TypeVar
@@ -23,6 +22,12 @@ _QUOTA_MARKERS = (
     "rate limit",
     "quota",
     "Quota exceeded",
+)
+
+# temporary blips (overloaded Google backend, timeouts) — retry, don't die
+_TRANSIENT_MARKERS = (
+    "503", "500", "UNAVAILABLE", "overloaded", "Try again",
+    "timeout", "timed out", "DEADLINE", "temporarily", "Internal error",
 )
 
 
@@ -38,19 +43,42 @@ class KeyRotator:
         self._keys = keys
         self._cooldown_s = cooldown_s
         self._cooldown_until: dict[str, float] = {}
-        self._cycle = itertools.cycle(keys)
+        self._uses: dict[str, int] = {}
+        self._last_use: dict[str, float] = {}
         self._lock = threading.Lock()
 
-    # -- key lifecycle ----------------------------------------------------
+    def stats(self) -> dict[str, int]:
+        """Successful calls per key (tail-masked) — proof of rotation."""
+        return {f"…{k[-4:]}": self._uses.get(k, 0) for k in self._keys}
+
     def _next_key(self) -> str | None:
+        """FAIR rotation (least-used-first):
+        1. among ready keys → pick the one with fewest successful uses
+        2. tie → the one idle the longest
+        3. tie → lowest index (k1, k2, k3 … order)"""
         now = time.time()
         with self._lock:
-            # one full lap over the cycle looking for a healthy key
-            for _ in range(len(self._keys)):
-                key = next(self._cycle)
-                if self._cooldown_until.get(key, 0.0) <= now:
-                    return key
-        return None
+            ready = [
+                k for k in self._keys
+                if self._cooldown_until.get(k, 0.0) <= now
+            ]
+            if not ready:
+                return None
+            ready.sort(key=lambda k: (self._uses.get(k, 0),
+                                      self._last_use.get(k, 0.0),
+                                      self._keys.index(k)))
+            return ready[0]
+
+    def soonest_ready_in(self) -> float:
+        """Seconds until the nearest key leaves cooldown (0 if one is ready)."""
+        now = time.time()
+        with self._lock:
+            for k in self._keys:
+                if self._cooldown_until.get(k, 0.0) <= now:
+                    return 0.0
+            if not self._cooldown_until:
+                return 0.0
+            return max(0.0, min(self._cooldown_until.values()) - now)
 
     def report_failure(self, key: str) -> None:
         with self._lock:
@@ -58,11 +86,9 @@ class KeyRotator:
 
     # -- main entry point -------------------------------------------------
     def execute(self, fn: Callable[[str], T], max_attempts: int | None = None) -> T:
-        """Run fn(api_key), rotating keys on quota errors.
-
-        Non-quota exceptions are re-raised immediately.
-        """
-        attempts = max_attempts or max(len(self._keys) * 2, 2)
+        """Run fn(api_key): rotate keys on quota errors, RETRY on transient
+        errors (503/overload/timeout). Only truly fatal errors propagate."""
+        attempts = max_attempts or max(len(self._keys) * 3, 4)
         last_exc: Exception | None = None
         for _ in range(attempts):
             key = self._next_key()
@@ -72,16 +98,23 @@ class KeyRotator:
                 time.sleep(min(max(soonest - time.time(), 1.0), 30.0))
                 continue
             try:
-                return fn(key)
+                result = fn(key)
+                self._uses[key] = self._uses.get(key, 0) + 1
+                self._last_use[key] = time.time()
+                return result
             except Exception as exc:  # noqa: BLE001 - deliberate broad catch
                 msg = f"{type(exc).__name__}: {exc}"
                 if any(m in msg for m in _QUOTA_MARKERS):
                     self.report_failure(key)
                     last_exc = exc
                     continue
+                if any(m in msg for m in _TRANSIENT_MARKERS):
+                    time.sleep(3.0)   # backend blip — retry (next attempt may use another key)
+                    last_exc = exc
+                    continue
                 raise
         raise NoKeysAvailable(
-            f"All keys are rate-limited. Last error: {last_exc}"
+            f"All keys busy/failing after {attempts} attempts. Last error: {last_exc}"
         )
 
 
