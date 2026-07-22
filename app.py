@@ -1,13 +1,9 @@
-"""Gujarati → English/Hindi AI dubbing app (Streamlit).
+"""Gujarati AI Dubbing Studio (Streamlit).
 
-Workflow:
-  1. Upload a Gujarati video
-  2. Gemini transcribes it (review & fix the transcript)
-  3. Gemini translates it (review & edit)
-  4. Natural TTS voices it, time-aligned to the original speech
-  5. Download the audio-swapped video + a package for the lip-sync Colab notebook
-
-Run:  streamlit run app.py
+Inputs:  Video | Audio | Imported transcript (Excel/CSV)
+Stages:  transcribe -> proofread -> translate -> voice -> export
+Long steps run as BACKGROUND JOBS (safe to switch tabs); runs are persisted
+on disk in ./runs so you can resume and download later.
 """
 
 from __future__ import annotations
@@ -19,34 +15,21 @@ import time
 import zipfile
 from pathlib import Path
 
-# make sure the script's own directory is importable (helps on cloud deploys)
-sys.path.insert(0, str(Path(__file__).resolve().parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent))  # cloud-import safety
 
 import pandas as pd
 import streamlit as st
 
-from dubbing import align, asr, translate, tts, videoutils
+from dubbing import align, asr, io_import, qa, store, translate, tts, videoutils
 from dubbing.keys import KeyRotator, load_keys_from_text
 
-st.set_page_config(page_title="Gujarati AI Dubbing", page_icon="🎬", layout="wide")
-st.title("🎬 Gujarati → English / Hindi AI Dubbing")
-st.caption(
-    "Gemini free-tier ASR + translation · natural TTS voices · time-aligned dubbing "
-    "· lip-sync via the companion Colab notebook"
-)
+st.set_page_config(page_title="Gujarati AI Dubbing Studio", page_icon="🎬", layout="wide")
+st.title("🎬 Gujarati AI Dubbing Studio")
+ss = st.session_state
 
 
-# ---------------------------------------------------------------- run folder
-def get_run_dir() -> Path:
-    if "run_dir" not in st.session_state:
-        run_dir = Path("runs") / time.strftime("run_%Y%m%d_%H%M%S")
-        run_dir.mkdir(parents=True, exist_ok=True)
-        st.session_state.run_dir = str(run_dir)
-    return Path(st.session_state.run_dir)
-
-
+# ------------------------------------------------------------------- helpers
 def _default_keys() -> str:
-    """Keys from env var, or Streamlit Secrets (for Community Cloud deploys)."""
     if os.environ.get("GEMINI_API_KEYS"):
         return os.environ["GEMINI_API_KEYS"]
     try:
@@ -55,43 +38,147 @@ def _default_keys() -> str:
         return ""
 
 
-# -------------------------------------------------------------------- sidebar
+def _safe_editor(df, **kwargs):
+    try:
+        return st.data_editor(df, width="stretch", **kwargs)
+    except TypeError:
+        return st.data_editor(df, use_container_width=True, **kwargs)
+
+
+def fmt_ts(sec: float) -> str:
+    m, s = divmod(int(sec), 60)
+    h, m = divmod(m, 60)
+    return f"{h}:{m:02d}:{s:02d}" if h else f"{m:02d}:{s:02d}"
+
+
+def get_run_dir() -> Path:
+    if "run_id" not in ss:
+        ss.run_id = store.new_run()
+    return store.run_dir(ss.run_id)
+
+
+def reset_stage_outputs(keep_transcript=False):
+    for k in ("track_wav", "dubbed_video", "subbed_video", "zip_path", "upload_sig"):
+        ss.pop(k, None)
+    if not keep_transcript:
+        for k in ("segments", "speakers", "imported"):
+            ss.pop(k, None)
+
+
+def merge_editor_rows(records, cols):
+    """Merge data_editor output into segments IN PLACE (never loses other fields)."""
+    segs = list(ss.segments)
+    out = []
+    for i, rec in enumerate(records):
+        row = dict(segs[i]) if i < len(segs) else {}
+        for k in cols:
+            if k in rec and rec[k] is not None:
+                row[k] = rec[k]
+        out.append(row)
+    ss.segments = out
+    store.save_segments(ss.run_id, out)
+
+
+def poll_job(kind: str, label: str):
+    """Block the page while a background job runs (it continues server-side if you leave)."""
+    ph = st.empty()
+    while True:
+        s = store.status(ss.run_id, kind)
+        if s.get("status") == "running":
+            ph.progress(min(float(s.get("pct", 0.0)), 1.0),
+                        text=f"{label}: {s.get('msg', '')}")
+            time.sleep(1.2)
+            continue
+        break
+    if s.get("status") == "error":
+        ph.empty()
+        st.error(f"❌ {label} failed: {s.get('msg')}")
+        with st.expander("Error details"):
+            st.code(s.get("tb", ""))
+        return None
+    ph.progress(1.0, text=f"{label}: ✅ done")
+    return store.job_result(ss.run_id, kind) or {}
+
+
+def refresh_from_store():
+    """Pull segments/artifacts of the current run from disk into session state."""
+    segs = store.load_segments(ss.run_id)
+    if segs:
+        ss.segments = segs
+        speakers = []
+        for s in segs:
+            sp = (s.get("speaker") or "").strip()
+            if sp and sp not in speakers:
+                speakers.append(sp)
+        ss.speakers = speakers
+    for key, pat in (("track_wav", "dubbed.wav"),):
+        art = store.artifact(ss.run_id, pat)
+        if art:
+            ss[key] = art
+    orig = sorted(Path(get_run_dir()).glob("original.*"))
+    if orig:
+        ss.video_path = str(orig[0])
+
+
+# ---------------------------------------------------------------- run bootstrap
+run_dir = get_run_dir()
+
+# ---------------------------------------------------------------- sidebar
 with st.sidebar:
     st.header("⚙️ Settings")
-
-    default_keys = _default_keys()
     keys_text = st.text_area(
         "Gemini API keys (one per line or comma-separated)",
-        value=default_keys,
-        height=110,
-        help="Create free keys at https://aistudio.google.com/app/apikey — "
-        "paste several; the app rotates automatically when one hits its free limit.",
+        value=_default_keys(), height=100,
+        help="Free keys: https://aistudio.google.com/app/apikey — add several; they rotate automatically.",
     )
     keys = load_keys_from_text(keys_text)
-    st.caption(f"🔑 {len(keys)} key(s) loaded" if keys else "🔑 No keys — required for transcription & translation")
+    st.caption(f"🔑 {len(keys)} key(s) loaded" if keys else "🔑 No keys yet")
+
+    mode = st.radio("Input type", ["🎬 Video", "🎵 Audio", "📄 Import transcript (Excel/CSV)"], key="mode")
 
     target_language = st.radio("Dub into", ["Hindi", "English"], horizontal=True)
-
     engine = st.radio(
-        "Voice engine",
-        ["edge", "gemini"],
+        "Voice engine", ["edge", "gemini"],
         format_func=lambda e: {
-            "edge": "Edge neural voices (free, no key needed, very reliable)",
-            "gemini": "Gemini 2.5 TTS (your keys; auto-falls back to Edge on quota)",
+            "edge": "Edge neural voices (free, reliable)",
+            "gemini": "Gemini 2.5 TTS (uses your keys; falls back to Edge)",
         }[e],
     )
-    if engine == "gemini":
+
+    speakers = ss.get("speakers") or []
+    speaker_voices: dict[str, str] = {}
+    dual_voices = False
+    voice = None
+    edge_opts = tts.EDGE_VOICES[target_language]
+    edge_voice_list = list(edge_opts)
+
+    if engine == "edge" and len(speakers) >= 2:
+        dual_voices = st.checkbox("🎭 Use a different voice per speaker", value=True)
+    if dual_voices:
+        for idx, sp in enumerate(speakers):
+            v = st.selectbox(
+                f"Voice — {sp}", edge_voice_list,
+                index=min(idx, len(edge_voice_list) - 1),
+                format_func=lambda x: f"{edge_opts[x]}",
+                key=f"voice_{sp}_{target_language}",
+            )
+            speaker_voices[sp] = v
+        voice = speaker_voices.get(speakers[0], edge_voice_list[0])
+    elif engine == "gemini":
         voice = st.selectbox(
-            "Voice",
-            list(tts.GEMINI_VOICES),
+            "Voice", list(tts.GEMINI_VOICES),
             format_func=lambda v: f"{v} — {tts.GEMINI_VOICES[v]}",
+            key=f"voice_gemini_{target_language}",
         )
+        if len(speakers) >= 2:
+            st.caption("🎭 Multi-speaker dual voices use the Edge engine.")
     else:
-        eopts = tts.EDGE_VOICES[target_language]
         voice = st.selectbox(
-            "Voice", list(eopts), format_func=lambda v: f"{eopts[v]}"
+            "Voice", edge_voice_list,
+            format_func=lambda x: f"{edge_opts[x]}",
+            key=f"voice_edge_{target_language}",
         )
-    edge_fallback = list(tts.EDGE_VOICES[target_language])[0]
+    edge_fallback = edge_voice_list[0]
 
     with st.expander("Advanced"):
         source_language = st.text_input("Source language", "Gujarati")
@@ -99,294 +186,371 @@ with st.sidebar:
         translate_model = st.text_input("Translation model", translate.TRANSLATE_MODEL)
         tts_model = st.text_input("Gemini TTS model", tts.TTS_MODEL)
         max_chunk = st.slider("Max ASR chunk (seconds)", 45, 120, 75)
-        show_cols = st.checkbox("Show per-segment audio player", value=False)
 
+    st.divider()
+    with st.expander("🗂 History / resume a run"):
+        if st.button("🆕 Start new project"):
+            reset_stage_outputs()
+            ss.run_id = store.new_run()
+            st.rerun()
+        runs = store.list_runs()
+        if not runs:
+            st.caption("No saved runs yet.")
+        for r in runs[:12]:
+            rid = r["id"]
+            c1, c2, c3 = st.columns([3, 1, 1])
+            c1.caption(f"**{r.get('label', rid)}**\n{rid} · {r.get('mode','?')} → {r.get('target','?')}")
+            if rid != ss.run_id and c2.button("Load", key=f"load_{rid}"):
+                reset_stage_outputs()
+                ss.run_id = rid
+                refresh_from_store()
+                st.rerun()
+            if c3.button("🗑", key=f"del_{rid}"):
+                store.delete_run(rid)
+                if rid == ss.run_id:
+                    reset_stage_outputs()
+                    ss.run_id = store.new_run()
+                st.rerun()
 
-# --- friendly key onboarding: paste keys right in the main window ---
+# --- key onboarding (main area) ---
 if not keys:
-    pasted = st.text_area(
-        "Paste API key(s) here — one per line",
-        placeholder="AIzaSy....",
-        height=90,
-        key="main_key_input",
-    )
-    keys.extend(load_keys_from_text(pasted))
-
+    pasted = st.text_area("Paste API key(s) here — one per line", placeholder="AIzaSy....",
+                          height=90, key="main_key_input")
+    if pasted.strip():
+        keys.extend(load_keys_from_text(pasted))
 if not keys:
     st.warning("🔑 **One step before we start** — add your free Gemini API key(s) above.")
     st.markdown(
         """
 **How to get a free key (1 minute):**
 1. Open 👉 [aistudio.google.com/app/apikey](https://aistudio.google.com/app/apikey)
-2. Sign in with your Google account → **Create API key** → copy it
-3. Paste it in the box above (optional: create keys in new Google projects for more free quota — the app rotates them automatically)
+2. Sign in → **Create API key** → copy it
+3. Paste above (more keys = more free daily quota — they rotate automatically)
 
 🔒 *Keys live only in your browser session — nothing is saved on any server.*
 """
     )
     st.stop()
 
-st.success(f"🔑 {len(keys)} API key(s) active — let's dub!")
+st.success(f"🔑 {len(keys)} API key(s) active")
+st.info(f"📁 Current project: **{ss.run_id}** — progress is saved automatically; "
+        f"you can switch tabs or leave and come back via 🗂 History.", icon="💾")
 
-
-def rotator_or_stop():
-    if not keys:
-        st.error("Add at least one Gemini API key in the sidebar (aistudio.google.com → Get API key).")
-        st.stop()
-    return KeyRotator(keys)
-
-
-def _safe_editor(df, **kwargs):
-    """data_editor that works on both new (width='stretch') and older Streamlit."""
-    try:
-        return st.data_editor(df, width="stretch", **kwargs)
-    except TypeError:
-        return st.data_editor(df, use_container_width=True, **kwargs)
-
+# ------------------------------------------------- show any running job live
+for _kind, _label in (("transcribe", "Transcription"), ("translate", "Translation"),
+                      ("voice", "Voicing"), ("subtitle", "Subtitles")):
+    if store.job_running(ss.run_id, _kind):
+        poll_job(_kind, _label)
+        refresh_from_store()
+        st.rerun()
 
 # ------------------------------------------------------------------ step 1
-st.header("1️⃣ Upload Gujarati video")
-uploaded = st.file_uploader("Video file", type=["mp4", "mov", "mkv", "webm", "m4v"])
-if uploaded and st.session_state.get("video_name") != uploaded.name:
-    run_dir = get_run_dir()
-    video_path = run_dir / f"original{Path(uploaded.name).suffix}"
-    video_path.write_bytes(uploaded.getbuffer())
-    st.session_state.update(
-        video_name=uploaded.name, video_path=str(video_path),
-        segments=None, voiced=None, track_wav=None, dubbed_video=None,
-        audio_wav=None, duration=None,
-    )
+st.header("1️⃣ Input")
 
-if st.session_state.get("video_path"):
-    video_path = Path(st.session_state.video_path)
-    st.video(str(video_path))
-    try:
-        videoutils.check_ffmpeg()
-        if not st.session_state.get("audio_wav"):
-            with st.spinner("Extracting audio…"):
-                wav = videoutils.extract_audio(video_path, get_run_dir() / "source.wav")
-                st.session_state.audio_wav = str(wav)
-                st.session_state.duration = videoutils.probe_duration_s(video_path)
-        dur = st.session_state.duration
-        st.info(f"Duration: **{dur:.1f}s** ({dur/60:.1f} min)")
-    except RuntimeError as exc:
-        st.error(str(exc))
-        st.code(videoutils.ffmpeg_python_hint())
-        st.stop()
+def _handle_new_upload(name: str):
+    return ss.get("upload_sig") != name
+
+if mode in ("🎬 Video", "🎵 Audio"):
+    is_video = mode == "🎬 Video"
+    ftypes = ["mp4", "mov", "mkv", "webm", "m4v"] if is_video else ["mp3", "wav", "m4a", "ogg", "aac", "flac"]
+    up = st.file_uploader(("Video file" if is_video else "Audio file"), type=ftypes)
+    if up and _handle_new_upload(up.name + up.type):
+        reset_stage_outputs()
+        ext = Path(up.name).suffix
+        media_path = run_dir / f"original{ext}"
+        media_path.write_bytes(up.getbuffer())
+        ss.upload_sig = up.name + up.type
+        ss.video_path = str(media_path) if is_video else None
+        ss.audio_input = None if is_video else str(media_path)
+        try:
+            videoutils.check_ffmpeg()
+            with st.spinner("Preparing audio for AI (ffmpeg)…"):
+                wav = videoutils.extract_audio(media_path, run_dir / "source.wav")
+            ss.audio_wav = str(wav)
+            ss.duration = videoutils.probe_duration_s(media_path)
+            store.save_meta(ss.run_id, label=up.name, mode="video" if is_video else "audio",
+                            target=target_language, duration=ss.duration)
+        except RuntimeError as exc:
+            st.error(str(exc))
+            st.code(videoutils.ffmpeg_python_hint())
+            st.stop()
+
+    if ss.get("video_path") and Path(ss.video_path).exists():
+        st.video(ss.video_path)
+        st.info(f"Duration: **{ss.get('duration', 0):.1f}s** ({ss.get('duration', 0)/60:.1f} min)")
+    elif ss.get("audio_input") and Path(ss.audio_input).exists():
+        st.audio(ss.audio_input)
+        st.info(f"Duration: **{ss.get('duration', 0):.1f}s** ({ss.get('duration', 0)/60:.1f} min)")
+
+else:  # transcript import
+    up = st.file_uploader("Excel (.xlsx/.xls) or CSV with columns: Speaker · Time From · Time To · Questions · Matter",
+                          type=["xlsx", "xls", "csv"])
+    if up and _handle_new_upload("import:" + up.name):
+        reset_stage_outputs()
+        try:
+            segs = io_import.import_transcript(up.getbuffer(), up.name)
+        except Exception as exc:
+            st.exception(exc)
+            st.stop()
+        ss.segments = segs
+        ss.imported = True
+        ss.speakers = []
+        for s in segs:
+            sp = (s.get("speaker") or "").strip()
+            if sp and sp not in ss.speakers:
+                ss.speakers.append(sp)
+        ss.duration = max(s["end"] for s in segs)
+        store.save_segments(ss.run_id, segs)
+        store.save_meta(ss.run_id, label=up.name, mode="import", target=target_language,
+                        duration=ss.duration)
+        ss.upload_sig = "import:" + up.name
+        st.success(f"✅ Imported {len(segs)} rows from {up.name}"
+                   + (f" · speakers: {', '.join(ss.speakers)}" if ss.speakers else ""))
+
+ready = bool(ss.get("audio_wav")) or bool(ss.get("imported"))
+segs = ss.get("segments")
 
 # ------------------------------------------------------------------ step 2
-if st.session_state.get("audio_wav"):
-    st.header("2️⃣ Transcribe (review & fix)")
-    col_a, col_b = st.columns([1, 4])
-    if col_a.button("🗣️ Transcribe with Gemini", type="primary"):
-        rot = rotator_or_stop()
-        bar = st.progress(0.0, text="Starting…")
-        def cb(p, msg): bar.progress(p, text=msg)
-        try:
-            segs = asr.transcribe_full(
-                st.session_state.audio_wav, get_run_dir(), rot,
-                model=asr_model, source_language=source_language,
-                max_chunk_s=max_chunk, progress_cb=cb,
-            )
-            st.session_state.segments = segs
-            st.session_state.voiced = None
-            bar.progress(1.0, text=f"Done — {len(segs)} segments")
-            st.success(f"✅ Transcription done ({len(segs)} segments) — review below, ⬇️ scroll down to Step 3. (Tip: don't click other buttons while a step's progress bar is running.)")
-        except Exception as exc:
-            st.exception(exc)
+if ready:
+    if ss.get("imported"):
+        st.header("2️⃣ Imported transcript (review)")
+    else:
+        st.header("2️⃣ Transcribe (review & fix)")
+        if st.button("🗣️ Start transcription (runs in background)", type="primary"):
+            def _transcribe_job(cb):
+                rot = KeyRotator(list(keys))
+                out = asr.transcribe_full(
+                    ss.audio_wav, str(run_dir), rot, model=asr_model,
+                    source_language=source_language, max_chunk_s=max_chunk,
+                    progress_cb=cb,
+                )
+                store.save_segments(ss.run_id, out)
+                return {"count": len(out)}
+            store.job_start(ss.run_id, "transcribe", _transcribe_job)
+            poll_job("transcribe", "Transcribing")
+            refresh_from_store()
+            st.rerun()
+        st.caption("Safe to switch tabs — the job keeps running server-side and saves to this project.")
 
-    segs = st.session_state.get("segments")
+    segs = ss.get("segments")
     if segs:
-        st.write("Review the Gujarati transcript — fixing misheard words here improves the whole dub:")
+        has_speaker = any((s.get("speaker") or "").strip() for s in segs)
         df = pd.DataFrame(
-            [{"start": s.get("start", 0.0), "end": s.get("end", 0.0), "text": s.get("text", "")}
+            [{"start": s.get("start", 0.0), "end": s.get("end", 0.0),
+              "speaker": s.get("speaker", ""), "text": s.get("text", "")}
              for s in segs]
         )
-        edited = _safe_editor(
-            df, num_rows="dynamic",
-            column_config={
-                "start": st.column_config.NumberColumn("Start (s)", format="%.2f", width="small"),
-                "end": st.column_config.NumberColumn("End (s)", format="%.2f", width="small"),
-                "text": st.column_config.TextColumn(f"{source_language} text", width="large"),
-            },
-            key="transcript_editor",
-        )
-        # merge edits IN PLACE so other fields (e.g. 'translated') survive refreshes
-        records = edited.to_dict("records")
-        current = list(st.session_state.segments)
-        out = []
-        for i, rec in enumerate(records):
-            row = dict(current[i]) if i < len(current) else {}
-            for k in ("start", "end", "text"):
-                if k in rec:
-                    row[k] = rec[k]
-            out.append(row)
-        st.session_state.segments = out
+        cols_cfg = {
+            "start": st.column_config.NumberColumn("Start (s)", format="%.2f", width="small"),
+            "end": st.column_config.NumberColumn("End (s)", format="%.2f", width="small"),
+            "text": st.column_config.TextColumn(f"{source_language} text — edit here if AI misheard", width="large"),
+        }
+        if has_speaker:
+            cols_cfg["speaker"] = st.column_config.TextColumn("Speaker", width="small")
+        edited = _safe_editor(df, num_rows="dynamic", column_config=cols_cfg, key="transcript_editor")
+        merge_editor_rows(edited.to_dict("records"), ("start", "end", "text", "speaker"))
+        segs = ss.segments
+
+# ------------------------------------------------------- proofreading panel
+if ready and segs:
+    with st.expander("🔎 Proofreading & completeness — verify nothing was skipped", expanded=True):
+        rep = qa.translation_report(segs)
+        m1, m2, m3 = st.columns(3)
+        m1.metric("Segments", rep["total"])
+        m2.metric("Translated", rep["translated"])
+        m3.metric("Missing translation", len(rep["missing"]) + len(rep["identical"]))
+        if ss.get("audio_wav"):
+            st.caption(f"Transcript covers speech from {fmt_ts(segs[0]['start'])} to {fmt_ts(segs[-1]['end'])} "
+                       f"(segment-time coverage {qa.coverage_pct(segs, ss.get('duration', 0))}% of file duration — "
+                       f"the rest is pauses/music, that's normal).")
+            if st.button("🔍 Scan for possibly missed speech"):
+                with st.spinner("Analyzing audio for uncovered speech…"):
+                    try:
+                        gaps = qa.speech_gaps(ss.audio_wav, segs)
+                    except Exception as exc:
+                        st.error(str(exc))
+                        gaps = None
+                if gaps is not None:
+                    if gaps:
+                        st.warning(f"Found {len(gaps)} spot(s) with speech but NO transcript — "
+                                   f"listen there and add/extend rows in the table above if needed:")
+                        st.dataframe(pd.DataFrame(
+                            [{"from": fmt_ts(g), "to": fmt_ts(h), "approx_seconds": round(h - g, 1)}
+                             for g, h in gaps][:50]))
+                    else:
+                        st.success("✅ No uncovered speech detected — nothing was skipped.")
+        else:
+            st.caption("Imported transcript — audio coverage scan not applicable (no source audio).")
+        if rep["identical"]:
+            st.info(f"{len(rep['identical'])} row(s) have translation identical to the original "
+                    f"(often names/numbers — or untranslated leftovers). Check rows: "
+                    + ", ".join(str(i + 1) for i in rep["identical"][:20]))
 
 # ------------------------------------------------------------------ step 3
-if st.session_state.get("segments"):
-    st.header("3️⃣ Translate")
-    col_a, col_b = st.columns([1, 4])
-    if col_a.button(f"🌍 Translate to {target_language}", type="primary"):
-        rot = rotator_or_stop()
-        bar = st.progress(0.0, text="Translating…")
-        try:
+def _translate_job_factory(only_missing: bool):
+    def _job(cb):
+        rot = KeyRotator(list(keys))
+        segs = store.load_segments(ss.run_id) or ss.segments
+        if only_missing:
+            idxs = [i for i, s in enumerate(segs)
+                    if not str(s.get("translated") or "").strip()
+                    or str(s.get("translated")).strip() == str(s.get("text")).strip()]
+            if not idxs:
+                return {"translated": 0}
+            subset = [segs[i] for i in idxs]
             out = translate.translate_segments(
-                st.session_state.segments, target_language, rot,
-                model=translate_model, source_language=source_language,
-                progress_cb=lambda p, m: bar.progress(p, text=m),
-            )
-            st.session_state.segments = out
-            st.session_state.voiced = None
-            bar.progress(1.0, text="Translation done")
-            st.success("✅ Translation complete — right column below. ⬇️ Scroll down to Step 4. (No need to click Translate again — clicking a button while something runs restarts it.)")
-        except Exception as exc:
-            st.exception(exc)
+                subset, target_language, rot, model=translate_model,
+                source_language=source_language, progress_cb=cb)
+            for i, row in zip(idxs, out):
+                segs[i]["translated"] = row["translated"]
+            translated_n = len(out)
+        else:
+            segs = translate.translate_segments(
+                segs, target_language, rot, model=translate_model,
+                source_language=source_language, progress_cb=cb)
+            translated_n = len(segs)
+        store.save_segments(ss.run_id, segs)
+        return {"translated": translated_n}
+    return _job
 
-    if any(s.get("translated") for s in st.session_state.segments):
-        st.caption("ℹ️ Left column = original Gujarati (reference — it stays Gujarati on purpose). Right column = translation; click any cell to edit it.")
+if ready and segs:
+    st.header("3️⃣ Translate")
+    c1, c2 = st.columns([1, 1])
+    if c1.button(f"🌍 Translate ALL to {target_language}", type="primary"):
+        store.job_start(ss.run_id, "translate", _translate_job_factory(False))
+        poll_job("translate", "Translating")
+        refresh_from_store()
+        st.rerun()
+    if c2.button("🩹 Translate only missing/identical rows"):
+        store.job_start(ss.run_id, "translate", _translate_job_factory(True))
+        poll_job("translate", "Translating missing rows")
+        refresh_from_store()
+        st.rerun()
+
+    if any(s.get("translated") for s in ss.segments):
+        st.caption("ℹ️ Left = original (stays unchanged). Right = translation (editable). "
+                   "Speaker labels are never translated — they select the voice.")
+        has_speaker = any((s.get("speaker") or "").strip() for s in ss.segments)
         df = pd.DataFrame(
-            [{"text": s.get("text", ""), "translated": s.get("translated", "")}
-             for s in st.session_state.segments]
+            [{"speaker": s.get("speaker", ""), "text": s.get("text", ""),
+              "translated": s.get("translated", "")} for s in ss.segments]
         )
-        edited = _safe_editor(
-            df,
-            column_config={
-                "text": st.column_config.TextColumn(f"Original ({source_language})", width="medium", disabled=True),
-                "translated": st.column_config.TextColumn(f"Translation ({target_language}) — editable", width="large"),
-            },
-            key="translation_editor",
-        )
-        # merge edits IN PLACE (defensive against refresh wiping other fields)
-        records = edited.to_dict("records")
-        segs = st.session_state.segments
-        for i, rec in enumerate(records):
-            if i < len(segs) and rec.get("translated") is not None:
-                segs[i]["translated"] = rec["translated"]
+        cols_cfg = {
+            "text": st.column_config.TextColumn(f"Original ({source_language})", width="medium", disabled=True),
+            "translated": st.column_config.TextColumn(f"Translation ({target_language}) — editable", width="large"),
+        }
+        if has_speaker:
+            cols_cfg["speaker"] = st.column_config.TextColumn("Speaker", width="small", disabled=True)
+        edited = _safe_editor(df, column_config=cols_cfg, key="translation_editor")
+        merge_editor_rows(edited.to_dict("records"), ("translated", "speaker"))
+        segs = ss.segments
 
 # ------------------------------------------------------------------ step 4
-if any(s.get("translated") for s in st.session_state.get("segments") or []):
+if ready and any(s.get("translated") for s in ss.get("segments") or []):
     st.header("4️⃣ Generate dubbed audio")
-    st.caption("⏳ Voicing takes ~2–4 min for a 5-min video. While the bar moves, **don't click anything** — clicks restart the step. Just wait for 100%.")
-    if st.button("🎙️ Voice & align all segments", type="primary"):
-        run_dir = get_run_dir()
-        rot = KeyRotator(keys) if keys else None
-        bar = st.progress(0.0, text="Voicing…")
-        try:
+    if dual_voices:
+        st.caption("🎭 Two-voice mode: " + "; ".join(f"{sp} → **{speaker_voices[sp]}**" for sp in speaker_voices))
+    st.caption("⏳ ~2–4 min per 5 min of content. Runs in background — safe to leave and come back.")
+    if st.button("🎙️ Start voicing & alignment (background)", type="primary"):
+        sp_map = dict(speaker_voices) if dual_voices else None
+
+        def _voice_job(cb):
+            rot = KeyRotator(list(keys)) if engine == "gemini" else None
+            segs = store.load_segments(ss.run_id) or ss.segments
             voiced = tts.synthesize_track(
-                st.session_state.segments,
-                run_dir / "voice_segments",
+                segs, run_dir / "voice_segments",
                 engine=engine, voice=voice, rotator=rot,
                 edge_fallback_voice=edge_fallback,
-                progress_cb=lambda p, m: bar.progress(p, text=m),
+                speaker_voices=sp_map,
+                progress_cb=lambda p, m: cb(0.8 * p, m),
             )
-            st.session_state.voiced = voiced
-            bar.progress(0.99, text="Assembling final track…")
             track = align.build_track(
-                voiced, st.session_state.duration, run_dir / "dubbed.wav",
+                voiced, ss.duration, run_dir / "dubbed.wav",
                 run_dir / "stretch_tmp",
+                progress_cb=lambda p, m: cb(0.8 + 0.2 * p, m),
             )
-            st.session_state.track_wav = str(track)
-            st.session_state.dubbed_video = None
-            bar.progress(1.0, text="Dubbed audio ready 🎉")
-            st.success("✅ Dubbed audio ready! ⬇️ Scroll down to hear the preview, then Step 5.")
-        except Exception as exc:
-            st.exception(exc)
-            st.warning("💡 If the error mentions network / websocket / edge-tts: switch the **Voice engine** in the sidebar to the other option and click this button again, once.")
+            return {"track": str(track)}
 
-    if st.session_state.get("voiced"):
-        voiced = st.session_state.voiced
-        used_gemini = sum(1 for s in voiced if s.get("engine") == "gemini")
-        used_edge = sum(1 for s in voiced if s.get("engine") == "edge")
-        st.caption(f"Voices used — Gemini: {used_gemini}, Edge: {used_edge}")
-        if show_cols:
-            for s in voiced:
-                if s.get("wav"):
-                    st.write(f"[{s['start']:.1f}s] {s.get('translated','')}")
-                    st.audio(s["wav"])
+        store.job_start(ss.run_id, "voice", _voice_job)
+        poll_job("voice", "Voicing")
+        refresh_from_store()
+        st.rerun()
 
-    if st.session_state.get("track_wav"):
-        st.subheader("Preview final audio track")
-        st.audio(st.session_state.track_wav)
+    if ss.get("track_wav") and Path(ss.track_wav).exists():
+        st.subheader("🎧 Preview final audio track")
+        st.audio(ss.track_wav)
+        st.download_button("⬇️ Download audio (WAV)",
+                           Path(ss.track_wav).read_bytes(),
+                           file_name=f"dub_{target_language.lower()}.wav", mime="audio/wav")
 
 # ------------------------------------------------------------------ step 5
-if st.session_state.get("track_wav"):
-    st.header("5️⃣ Export & lip-sync")
-    if st.button("▶️ Create dubbed video + lip-sync package", type="primary"):
-        run_dir = get_run_dir()
-        with st.spinner("Muxing video…"):
-            dubbed = videoutils.mux_audio_video(
-                st.session_state.video_path,
-                st.session_state.track_wav,
-                run_dir / f"dubbed_{target_language.lower()}.mp4",
-            )
-        videoutils.write_srt(st.session_state.segments, run_dir / "original.srt")
-        videoutils.write_srt(st.session_state.segments, run_dir / "dub.srt", text_key="translated")
+if ready and ss.get("track_wav") and Path(ss.track_wav).exists():
+    st.header("5️⃣ Export")
+    videoutils.write_srt(ss.segments, run_dir / "original.srt")
+    videoutils.write_srt(ss.segments, run_dir / "dub.srt", text_key="translated")
+    st.download_button("⬇️ Subtitles (SRT): original", (run_dir / "original.srt").read_bytes(),
+                       file_name="original.srt", key="dl_srt_orig")
+    st.download_button(f"⬇️ Subtitles (SRT): {target_language}", (run_dir / "dub.srt").read_bytes(),
+                       file_name="dub.srt", key="dl_srt_dub")
 
-        # package everything the Colab notebook needs
-        pkg_dir = run_dir / "lipsync_package"
-        pkg_dir.mkdir(exist_ok=True)
-        shutil.copy(st.session_state.video_path, pkg_dir / "original.mp4")
-        shutil.copy(st.session_state.track_wav, pkg_dir / "dub.wav")
-        (pkg_dir / "INSTRUCTIONS.txt").write_text(
-            "Lip-sync package generated by the Gujarati Dubbing app.\n\n"
-            "1. Open lipsync_colab.ipynb in Google Colab (Runtime → GPU T4 or better).\n"
-            "2. Upload this zip (or the two media files) when the notebook asks.\n"
-            "3. Run all cells → download the final lip-synced mp4.\n",
-            encoding="utf-8",
-        )
-        zip_path = run_dir / "lipsync_package.zip"
-        with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
-            for f in pkg_dir.iterdir():
-                zf.write(f, f.name)
+    if mode == "🎬 Video" and ss.get("video_path") and Path(ss.video_path).exists():
+        if st.button("▶️ Build dubbed video + lip-sync package", type="primary"):
+            with st.spinner("Muxing video…"):
+                dubbed = videoutils.mux_audio_video(
+                    ss.video_path, ss.track_wav,
+                    run_dir / f"dubbed_{target_language.lower()}.mp4")
+            pkg = run_dir / "lipsync_package"
+            pkg.mkdir(exist_ok=True)
+            shutil.copy(ss.video_path, pkg / "original.mp4")
+            shutil.copy(ss.track_wav, pkg / "dub.wav")
+            (pkg / "INSTRUCTIONS.txt").write_text(
+                "Open lipsync_colab.ipynb in Colab (T4 GPU) and upload this zip.\n",
+                encoding="utf-8")
+            zip_path = run_dir / "lipsync_package.zip"
+            with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+                for f in pkg.iterdir():
+                    zf.write(f, f.name)
+            ss.dubbed_video = str(dubbed)
+            ss.zip_path = str(zip_path)
 
-        st.session_state.dubbed_video = str(dubbed)
-        st.session_state.zip_path = str(zip_path)
-
-    if st.session_state.get("dubbed_video"):
-        st.success("Ready! Two outputs:")
-        c1, c2 = st.columns(2)
-        with c1:
-            st.subheader("Dubbed video (audio swapped)")
-            st.video(st.session_state.dubbed_video)
-            st.download_button(
-                "⬇️ Download dubbed video",
-                Path(st.session_state.dubbed_video).read_bytes(),
-                file_name=f"dubbed_{target_language.lower()}.mp4",
-                mime="video/mp4",
-            )
-        with c2:
-            st.subheader("For lip-sync (Colab)")
-            st.download_button(
-                "⬇️ Download lip-sync package (.zip)",
-                Path(st.session_state.zip_path).read_bytes(),
-                file_name="lipsync_package.zip",
-                mime="application/zip",
-            )
-            st.markdown(
-                "Lips don't move yet in the left video. To fix: open "
-                "**lipsync_colab.ipynb** (in this project folder) in Google Colab "
-                "with a free T4 GPU, upload this zip, and run all cells — "
-                "MuseTalk will re-animate the mouth to match the new audio. "
-                "*(Long videos: the notebook now auto-splits into chunks.)*"
-            )
+        col_a, col_b = st.columns(2)
+        if ss.get("dubbed_video") and Path(ss.dubbed_video).exists():
+            with col_a:
+                st.subheader("Dubbed video")
+                st.video(ss.dubbed_video)
+                st.download_button("⬇️ Download dubbed video",
+                                   Path(ss.dubbed_video).read_bytes(),
+                                   file_name=f"dubbed_{target_language.lower()}.mp4", mime="video/mp4")
+            with col_b:
+                st.subheader("For lip-sync (Colab)")
+                st.download_button("⬇️ Download lip-sync package (.zip)",
+                                   Path(ss.zip_path).read_bytes(),
+                                   file_name="lipsync_package.zip", mime="application/zip")
 
         st.divider()
         st.subheader("📝 Optional: subtitled version (no Colab needed)")
-        st.caption("Skips lip-sync — burns the translated subtitles into the dubbed video instead. Good for long videos.")
-        if st.button("Create subtitled video"):
-            with st.spinner("Rendering subtitles (a few minutes per 15 min of video)…"):
-                subbed = videoutils.burn_subtitles(
-                    st.session_state.dubbed_video,
-                    get_run_dir() / "dub.srt",
-                    get_run_dir() / f"dubbed_{target_language.lower()}_subtitled.mp4",
-                )
-                st.session_state.subbed_video = str(subbed)
-        if st.session_state.get("subbed_video"):
-            st.video(st.session_state.subbed_video)
-            st.download_button(
-                "⬇️ Download subtitled video",
-                Path(st.session_state.subbed_video).read_bytes(),
-                file_name=f"dubbed_{target_language.lower()}_subtitled.mp4",
-                mime="video/mp4",
-            )
+        st.caption("Burns translated subtitles into the dubbed video. Good for long videos.")
+        if st.button("Create subtitled video (background)"):
+            def _subtitle_job(cb):
+                cb(0.1, "rendering…")
+                out = videoutils.burn_subtitles(
+                    ss.dubbed_video, run_dir / "dub.srt",
+                    run_dir / f"dubbed_{target_language.lower()}_subtitled.mp4")
+                cb(1.0, "done")
+                return {"video": str(out)}
+            if not ss.get("dubbed_video"):
+                st.warning("Build the dubbed video first (button above).")
+            else:
+                store.job_start(ss.run_id, "subtitle", _subtitle_job)
+                poll_job("subtitle", "Subtitles")
+                refresh_from_store()
+        if store.job_result(ss.run_id, "subtitle"):
+            subbed = store.job_result(ss.run_id, "subtitle").get("video")
+            if subbed and Path(subbed).exists():
+                st.video(subbed)
+                st.download_button("⬇️ Download subtitled video", Path(subbed).read_bytes(),
+                                   file_name=f"dubbed_{target_language.lower()}_subtitled.mp4",
+                                   mime="video/mp4", key="dl_subbed")
+    else:
+        st.info("🎵 Audio/transcript project — the dubbed audio (WAV) and subtitles above are your outputs. "
+                "Lip-sync applies to video input only.")
