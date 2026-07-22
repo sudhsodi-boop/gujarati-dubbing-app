@@ -148,3 +148,39 @@ def build_track(
     out_wav.parent.mkdir(parents=True, exist_ok=True)
     normalize(track, headroom=1.0).export(str(out_wav), format="wav")
     return out_wav
+
+
+def overlay_regions(
+    track_wav: str | Path,
+    source_wav: str | Path,
+    ranges: list[dict],
+    out_wav: str | Path | None = None,
+    fade_ms: int = 500,
+) -> Path:
+    """Copy the ORIGINAL audio for song/music ranges into the dubbed track.
+
+    Speech segments were skipped for those stretches, so the track is silent
+    there — overlaying the original audio keeps songs/bhajans alive in the dub
+    (professional dubs keep songs in the original language).
+    """
+    if not ranges:
+        return Path(out_wav or track_wav)
+    track = AudioSegment.from_wav(str(track_wav))
+    src = AudioSegment.from_wav(str(source_wav))
+    for r in ranges:
+        s_ms, e_ms = int(r["start"] * 1000), int(r["end"] * 1000)
+        s_ms = max(0, min(s_ms, len(src)))
+        e_ms = max(s_ms, min(e_ms, len(src)))
+        if e_ms - s_ms < 500:
+            continue
+        clip = src[s_ms:e_ms]
+        clip = (clip.set_frame_rate(track.frame_rate)
+                    .set_channels(track.channels)
+                    .set_sample_width(track.sample_width))
+        f = min(fade_ms, max(50, len(clip) // 4))
+        clip = clip.fade_in(f).fade_out(f)
+        track = _ensure_length(track, e_ms)
+        track = track.overlay(clip, position=s_ms)
+    out = Path(out_wav or track_wav)
+    track.export(str(out), format="wav")
+    return out

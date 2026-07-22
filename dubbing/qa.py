@@ -18,8 +18,13 @@ def speech_gaps(
     segments: list[dict],
     min_gap_s: float = 3.0,
     min_silence_ms: int = 900,
+    ignore_ranges: list[dict] | None = None,
 ) -> list[tuple[float, float]]:
-    """Return [(start_s, end_s)] of spoken audio not covered by any segment."""
+    """Return [(start_s, end_s)] of spoken audio not covered by any segment.
+
+    ignore_ranges (e.g. skipped song sections) count as "covered" so they
+    are not reported as missed speech.
+    """
     if isinstance(audio, (str, Path)):
         audio = AudioSegment.from_wav(str(audio))
     dbfs = audio.dBFS
@@ -32,6 +37,10 @@ def speech_gaps(
         for s in segments
         if s.get("end", 0) > s.get("start", 0)
     )
+    for r in ignore_ranges or []:
+        if r.get("end", 0) > r.get("start", 0):
+            seg_ints.append((int(r["start"] * 1000), int(r["end"] * 1000)))
+    seg_ints.sort()
     gaps = []
     for a, b in nonsilent:
         cur = a

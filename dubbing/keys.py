@@ -28,6 +28,9 @@ _QUOTA_MARKERS = (
 _TRANSIENT_MARKERS = (
     "503", "500", "UNAVAILABLE", "overloaded", "Try again",
     "timeout", "timed out", "DEADLINE", "temporarily", "Internal error",
+    # malformed JSON from the model -> retry (usually with another key)
+    "JSONDecodeError", "Expecting", "No JSON array",
+    "Unterminated", "Extra data", "Invalid control character",
 )
 
 
@@ -46,6 +49,9 @@ class KeyRotator:
         self._uses: dict[str, int] = {}
         self._last_use: dict[str, float] = {}
         self._lock = threading.Lock()
+
+    def __len__(self) -> int:
+        return len(self._keys)
 
     def stats(self) -> dict[str, int]:
         """Successful calls per key (tail-masked) — proof of rotation."""
@@ -104,12 +110,15 @@ class KeyRotator:
                 return result
             except Exception as exc:  # noqa: BLE001 - deliberate broad catch
                 msg = f"{type(exc).__name__}: {exc}"
+                # a FAILED key goes to the back of the queue: stamp its attempt
+                # so fair least-used selection tries your OTHER keys next
+                self._last_use[key] = time.time()
                 if any(m in msg for m in _QUOTA_MARKERS):
                     self.report_failure(key)
                     last_exc = exc
                     continue
                 if any(m in msg for m in _TRANSIENT_MARKERS):
-                    time.sleep(3.0)   # backend blip — retry (next attempt may use another key)
+                    time.sleep(3.0)   # backend blip / bad JSON — retry (next attempt uses another key)
                     last_exc = exc
                     continue
                 raise

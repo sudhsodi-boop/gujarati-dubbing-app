@@ -90,6 +90,26 @@ def load_segments(run_id: str) -> list[dict] | None:
     return None
 
 
+# ------------------------------------------------------------------ small json
+def save_json(run_id: str, name: str, data) -> None:
+    """Persist a small JSON-able object for the run (e.g. song ranges)."""
+    safe = "".join(c for c in name if c.isalnum() or c in "-_")
+    (_run_dir(run_id) / f"{safe}.json").write_text(
+        json.dumps(data, ensure_ascii=False, indent=1), encoding="utf-8"
+    )
+
+
+def load_json(run_id: str, name: str, default=None):
+    safe = "".join(c for c in name if c.isalnum() or c in "-_")
+    p = _run_dir(run_id) / f"{safe}.json"
+    if p.exists():
+        try:
+            return json.loads(p.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+    return default
+
+
 def artifact(run_id: str, name: str) -> str | None:
     p = _run_dir(run_id) / name
     return str(p) if p.exists() else None
