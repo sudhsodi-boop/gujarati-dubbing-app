@@ -21,7 +21,7 @@ import pandas as pd
 import streamlit as st
 
 from dubbing import align, asr, io_import, qa, store, translate, tts, videoutils
-from dubbing.keys import KeyRotator, load_keys_from_text
+from dubbing.keys import KeyRotator, load_keys_from_text, AllKeysQuotaExhausted
 
 st.set_page_config(page_title="Gujarati AI Dubbing Studio", page_icon="🎬", layout="wide")
 st.title("🎬 Gujarati AI Dubbing Studio")
@@ -286,10 +286,29 @@ st.info(f"📁 Current project: **{ss.run_id}** — progress is saved automatica
 for _kind, _label in (("transcribe", "Transcription"), ("translate", "Translation"),
                       ("voice", "Voicing"), ("subtitle", "Subtitles")):
     if store.job_running(ss.run_id, _kind):
-        _asking = (_kind == "voice"
-                   and store.get_flag(ss.run_id, "ask_fallback")
-                   and not store.get_flag(ss.run_id, "fallback_decision"))
-        if _asking:
+        # Check for transcription quota wait prompt
+        _quota_ask = (_kind == "transcribe"
+                      and store.get_flag(ss.run_id, "ask_quota_wait")
+                      and not store.get_flag(ss.run_id, "quota_decision"))
+        _voice_ask = (_kind == "voice"
+                      and store.get_flag(ss.run_id, "ask_fallback")
+                      and not store.get_flag(ss.run_id, "fallback_decision"))
+        
+        if _quota_ask:
+            qinfo = store.get_flag(ss.run_id, "ask_quota_wait") or {}
+            wait_msg = qinfo.get("message", "Quota exhausted — waiting for reset.")
+            st.warning(f"🔴 **All {len(keys)} Gemini API keys have hit their daily free quota.**\n\n"
+                       f"{wait_msg}\n\n"
+                       f"**What would you like to do?**")
+            c1, c2 = st.columns(2)
+            if c1.button("⏳ Wait for quota reset (could be hours)", key="quota_wait", type="primary"):
+                store.set_flag(ss.run_id, "quota_decision", "wait")
+                st.rerun()
+            if c2.button("❌ Cancel transcription", key="quota_cancel"):
+                store.set_flag(ss.run_id, "quota_decision", "cancel")
+                st.rerun()
+            st.caption("(Transcription is PAUSED — no content is lost. Your choice resumes or cancels.)")
+        elif _voice_ask:
             st.warning("⏳ All Gemini keys have been cooling for a while. "
                        "What should I do for the remaining lines?")
             c1, c2 = st.columns(2)
@@ -407,16 +426,125 @@ if ready:
             def _transcribe_job(cb, a=job_args):
                 cb(0.01, "Splitting audio into chunks…")
                 rot = KeyRotator(list(a["keys"]))
-                segs_out, songs = asr.transcribe_full(
-                    a["audio_path"], a["work_dir"], rot, model=a["model"],
-                    source_language=a["src"], max_chunk_s=a["max_chunk"],
-                    skip_songs=a["skip_songs"],
-                    progress_cb=cb,
-                )
-                store.save_segments(a["run_id"], segs_out)
-                store.save_json(a["run_id"], "songs", songs)
-                return {"count": len(segs_out), "songs": len(songs),
-                        "key_usage": rot.stats()}
+                
+                # --- RESUME: load existing segments & find where we left off ---
+                existing_segments = store.load_segments(a["run_id"]) or []
+                existing_songs = store.load_json(a["run_id"], "songs") or []
+                existing_count = len(existing_segments)
+                
+                # Get chunk boundaries to know which chunks are already done
+                chunks = asr.chunk_audio(a["audio_path"], Path(a["work_dir"]) / "chunks", 
+                                         max_chunk_s=a["max_chunk"])
+                
+                def _chunk_range(idx):
+                    """Return (start, end) of chunk idx in global timeline."""
+                    _, offset = chunks[idx]
+                    chunk_path = chunks[idx][0]
+                    from pydub import AudioSegment
+                    dur = len(AudioSegment.from_wav(str(chunk_path))) / 1000.0
+                    return offset, offset + dur
+                
+                # Find first chunk that has NO segments covering its range
+                start_chunk = 0
+                if existing_count > 0:
+                    for idx, (chunk_path, offset) in enumerate(chunks):
+                        c_start, c_end = _chunk_range(idx)
+                        # Check if any existing segment overlaps this chunk's range significantly
+                        covered = any(
+                            s["start"] < c_end and s["end"] > c_start
+                            for s in existing_segments
+                        )
+                        if not covered:
+                            start_chunk = idx
+                            break
+                    else:
+                        start_chunk = len(chunks)  # all done
+                
+                # Start with existing segments/songs
+                speech = [dict(s) for s in existing_segments]
+                songs = [dict(s) for s in existing_songs]
+                
+                if start_chunk > 0:
+                    cb(0.1, f"📂 Resuming from chunk {start_chunk + 1}/{len(chunks)} "
+                         f"({existing_count} segments already transcribed)…")
+                
+                while True:
+                    try:
+                        # Process remaining chunks
+                        for i in range(start_chunk, len(chunks)):
+                            chunk_path, offset = chunks[i]
+                            segs = asr._transcribe_chunk_safe(
+                                chunk_path, rot, a["model"], a["src"], a["skip_songs"]
+                            )
+                            for s in segs:
+                                s["start"] = round(s["start"] + offset, 3)
+                                s["end"] = round(s["end"] + offset, 3)
+                                if s.get("kind") == "song":
+                                    songs.append({"start": s["start"], "end": s["end"]})
+                                    if not a["skip_songs"]:
+                                        s["text"] = s.get("text") or "🎵 (song)"
+                                        speech.append(s)
+                                else:
+                                    s.pop("kind", None)
+                                    speech.append(s)
+                            
+                            # --- CHECKPOINT SAVE after EACH chunk ---
+                            store.save_segments(a["run_id"], speech)
+                            store.save_json(a["run_id"], "songs", songs)
+                            
+                            if progress_cb:
+                                usage = " · ".join(f"{k}:{v}" for k, v in rot.stats().items())
+                                progress_cb(
+                                    (i + 1) / len(chunks),
+                                    f"Chunk {i + 1}/{len(chunks)} · 🔑 {usage}"
+                                    + (f" · 🎵 {len(songs)} song part(s) so far" if songs else ""),
+                                )
+                        
+                        # All chunks done
+                        speech.sort(key=lambda d: d["start"])
+                        songs = asr._merge_song_ranges(songs) if a["skip_songs"] else []
+                        store.save_segments(a["run_id"], speech)
+                        store.save_json(a["run_id"], "songs", songs)
+                        return {"count": len(speech), "songs": len(songs),
+                                "key_usage": rot.stats()}
+                        
+                    except AllKeysQuotaExhausted as e:
+                        # All keys exhausted — ask user whether to wait
+                        retry_after = e.retry_after_s
+                        if retry_after is None or retry_after > 86400:
+                            wait_msg = "Quota resets at midnight Pacific time (could be many hours)."
+                        elif retry_after > 3600:
+                            wait_msg = f"Estimated wait: ~{retry_after/3600:.1f} hours."
+                        elif retry_after > 60:
+                            wait_msg = f"Estimated wait: ~{retry_after/60:.0f} minutes."
+                        else:
+                            wait_msg = f"Estimated wait: ~{retry_after:.0f} seconds."
+                        
+                        # Set flag for UI to show prompt
+                        store.set_flag(a["run_id"], "ask_quota_wait", {
+                            "retry_after": retry_after,
+                            "message": wait_msg,
+                            "timestamp": time.time()
+                        })
+                        store.set_flag(a["run_id"], "quota_decision", None)
+                        
+                        # Update job status to waiting
+                        _write_status(a["run_id"], "transcribe", status="waiting", 
+                                     pct=0.5, msg=f"All keys quota exhausted. {wait_msg}")
+                        
+                        # Wait for user decision
+                        while True:
+                            decision = store.get_flag(a["run_id"], "quota_decision")
+                            if decision == "wait":
+                                store.set_flag(a["run_id"], "ask_quota_wait", None)
+                                store.set_flag(a["run_id"], "quota_decision", None)
+                                cb(0.5, "Resuming transcription after quota wait…")
+                                break  # retry the transcription (will resume from last checkpoint)
+                            elif decision == "cancel":
+                                store.set_flag(a["run_id"], "ask_quota_wait", None)
+                                store.set_flag(a["run_id"], "quota_decision", None)
+                                raise RuntimeError("Transcription cancelled by user — all keys quota exhausted.")
+                            time.sleep(2.0)
 
             store.job_start(ss.run_id, "transcribe", _transcribe_job)
             res = poll_job("transcribe", "Transcribing")
