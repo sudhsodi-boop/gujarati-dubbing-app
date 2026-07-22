@@ -119,6 +119,7 @@ def refresh_from_store():
         art = store.artifact(ss.run_id, pat)
         if art:
             ss[key] = art
+    ss.songs = store.load_json(ss.run_id, "songs") or []
     orig = sorted(Path(get_run_dir()).glob("original.*"))
     if orig:
         ss.video_path = str(orig[0])
@@ -175,6 +176,14 @@ with st.sidebar:
         st.caption("Strict: every line locked to its exact original time slot — best for the Colab lip-sync step, but long translations may speed up and leave gaps.")
     else:
         st.caption("Continuous: lines flow back-to-back like the original — artificial pauses capped at ~1.2s, gentle even pacing.")
+
+    skip_songs = st.checkbox(
+        "🎵 Skip songs & music (bhajan/kirtan)",
+        value=True,
+        help="Songs are NOT transcribed, translated or voiced — the ORIGINAL song audio is kept as-is in the final dub, so there is no dead air.",
+    )
+    if skip_songs:
+        st.caption("Songs are auto-detected during transcription and kept in the original audio.")
 
     speakers = ss.get("speakers") or []
     speaker_voices: dict[str, str] = {}
@@ -392,18 +401,22 @@ if ready:
             job_args = dict(
                 audio_path=str(ss.audio_wav), work_dir=str(run_dir), run_id=ss.run_id,
                 keys=list(keys), model=asr_model, src=source_language, max_chunk=max_chunk,
+                skip_songs=skip_songs,
             )
 
             def _transcribe_job(cb, a=job_args):
                 cb(0.01, "Splitting audio into chunks…")
                 rot = KeyRotator(list(a["keys"]))
-                out = asr.transcribe_full(
+                segs_out, songs = asr.transcribe_full(
                     a["audio_path"], a["work_dir"], rot, model=a["model"],
                     source_language=a["src"], max_chunk_s=a["max_chunk"],
+                    skip_songs=a["skip_songs"],
                     progress_cb=cb,
                 )
-                store.save_segments(a["run_id"], out)
-                return {"count": len(out)}
+                store.save_segments(a["run_id"], segs_out)
+                store.save_json(a["run_id"], "songs", songs)
+                return {"count": len(segs_out), "songs": len(songs),
+                        "key_usage": rot.stats()}
 
             store.job_start(ss.run_id, "transcribe", _transcribe_job)
             res = poll_job("transcribe", "Transcribing")
@@ -416,6 +429,14 @@ if ready:
                 st.stop()
             st.rerun()
         st.caption("Safe to switch tabs — the job keeps running server-side and saves to this project.")
+        _tres = store.job_result(ss.run_id, "transcribe")
+        if _tres:
+            if _tres.get("key_usage"):
+                st.caption("🔑 Transcription key rotation: " + ", ".join(
+                    f"{k} → {v} calls" for k, v in _tres["key_usage"].items()))
+            if _tres.get("songs"):
+                st.success(f"🎵 {_tres['songs']} song/music section(s) were detected and skipped "
+                           "— their ORIGINAL audio will be kept in the final dub.")
 
     segs = ss.get("segments")
     if segs:
@@ -448,10 +469,15 @@ if ready and segs:
             st.caption(f"Transcript covers speech from {fmt_ts(segs[0]['start'])} to {fmt_ts(segs[-1]['end'])} "
                        f"(segment-time coverage {qa.coverage_pct(segs, ss.get('duration', 0))}% of file duration — "
                        f"the rest is pauses/music, that's normal).")
+            _songs = ss.get("songs") or []
+            if _songs:
+                st.info("🎵 Song/music sections skipped (kept in original audio): "
+                        + " · ".join(f"{fmt_ts(r['start'])}–{fmt_ts(r['end'])}" for r in _songs[:10])
+                        + (f" … +{len(_songs) - 10} more" if len(_songs) > 10 else ""))
             if st.button("🔍 Scan for possibly missed speech"):
                 with st.spinner("Analyzing audio for uncovered speech…"):
                     try:
-                        gaps = qa.speech_gaps(ss.audio_wav, segs)
+                        gaps = qa.speech_gaps(ss.audio_wav, segs, ignore_ranges=ss.get("songs"))
                     except Exception as exc:
                         st.error(str(exc))
                         gaps = None
@@ -579,12 +605,28 @@ if ready and any(s.get("translated") for s in ss.get("segments") or []):
                 progress_cb=lambda p, m: cb(0.8 + 0.2 * p, m),
                 mode=a["pacing"],
             )
+            # keep the ORIGINAL audio under skipped song/bhajan sections
+            songs = store.load_json(a["run_id"], "songs") or []
+            songs_mixed = 0
+            if songs:
+                src_wav = run_p / "source.wav"
+                if not src_wav.exists():
+                    orig = next(iter(sorted(run_p.glob("original.*"))), None)
+                    if orig:
+                        try:
+                            src_wav = Path(videoutils.extract_audio(orig, run_p / "song_source.wav"))
+                        except Exception:
+                            src_wav = None
+                if src_wav and src_wav.exists():
+                    cb(0.98, f"Mixing {len(songs)} original song section(s) into the dub…")
+                    align.overlay_regions(str(track), str(src_wav), songs)
+                    songs_mixed = len(songs)
             counts = {"gemini": 0, "edge": 0}
             for r in voiced:
                 if r.get("engine") in counts:
                     counts[r["engine"]] += 1
             return {
-                "track": str(track), **counts,
+                "track": str(track), **counts, "songs_mixed": songs_mixed,
                 "key_usage": rot.stats() if rot else {},
             }
 
@@ -593,17 +635,21 @@ if ready and any(s.get("translated") for s in ss.get("segments") or []):
         refresh_from_store()
         if res is None:
             st.stop()
-        if res.get("key_usage"):
-            st.caption("🔑 Key rotation stats: " + ", ".join(
-                f"{k} → {v} calls" for k, v in res["key_usage"].items()))
-        if engine == "gemini" and res.get("edge"):
-            st.info(
-                f"ℹ️ {res['edge']} of {res.get('gemini', 0) + res.get('edge', 0)} segments "
-                f"temporarily used the gender-matched Edge backup while ALL Gemini keys were "
-                f"cooling down (rotation then resumed automatically). Add more keys from "
-                f"DIFFERENT projects to shrink this."
-            )
         st.rerun()
+
+    _vres = store.job_result(ss.run_id, "voice") or {}
+    if _vres.get("key_usage"):
+        st.caption("🔑 Key rotation stats: " + ", ".join(
+            f"{k} → {v} calls" for k, v in _vres["key_usage"].items()))
+    if _vres.get("songs_mixed"):
+        st.success(f"🎵 {_vres['songs_mixed']} song/music section(s) kept their ORIGINAL audio in the dub.")
+    if engine == "gemini" and _vres.get("edge"):
+        st.info(
+            f"ℹ️ {_vres['edge']} of {_vres.get('gemini', 0) + _vres.get('edge', 0)} segments "
+            f"temporarily used the gender-matched Edge backup while ALL Gemini keys were "
+            f"cooling down (rotation then resumed automatically). Add more keys from "
+            f"DIFFERENT projects to shrink this."
+        )
 
     if ss.get("track_wav") and Path(ss.track_wav).exists():
         st.subheader("🎧 Preview final audio track")
