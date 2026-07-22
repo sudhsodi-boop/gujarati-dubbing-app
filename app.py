@@ -58,7 +58,8 @@ def get_run_dir() -> Path:
 
 
 def reset_stage_outputs(keep_transcript=False):
-    for k in ("track_wav", "dubbed_video", "subbed_video", "zip_path", "upload_sig"):
+    for k in ("track_wav", "dubbed_video", "subbed_video", "zip_path",
+              "upload_sig", "import_video_sig", "audio_input"):
         ss.pop(k, None)
     if not keep_transcript:
         for k in ("segments", "speakers", "imported"):
@@ -84,9 +85,12 @@ def poll_job(kind: str, label: str):
     ph = st.empty()
     while True:
         s = store.status(ss.run_id, kind)
-        if s.get("status") == "running":
-            ph.progress(min(float(s.get("pct", 0.0)), 1.0),
-                        text=f"{label}: {s.get('msg', '')}")
+        running = (s.get("status") == "running") or (
+            not s and store.job_running(ss.run_id, kind)
+        )
+        if running:
+            ph.progress(min(float(s.get("pct", 0.02) or 0.02), 1.0),
+                        text=f"{label}: {s.get('msg', 'working…')}")
             time.sleep(1.2)
             continue
         break
@@ -144,6 +148,17 @@ with st.sidebar:
             "gemini": "Gemini 2.5 TTS (uses your keys; falls back to Edge)",
         }[e],
     )
+
+    pacing = st.radio(
+        "Speech pacing",
+        ["Continuous speech (no pauses)", "Strict lip-sync (exact timings)"],
+        index=0,
+    )
+    pacing_mode = "flow" if pacing.startswith("Continuous") else "strict"
+    if pacing_mode == "strict":
+        st.caption("Strict: every line locked to its exact original time slot — best for the Colab lip-sync step, but long translations may speed up and leave gaps.")
+    else:
+        st.caption("Continuous: lines flow back-to-back like the original — artificial pauses capped at ~1.2s, gentle even pacing.")
 
     speakers = ss.get("speakers") or []
     speaker_voices: dict[str, str] = {}
@@ -305,7 +320,27 @@ else:  # transcript import
                         duration=ss.duration)
         ss.upload_sig = "import:" + up.name
         st.success(f"✅ Imported {len(segs)} rows from {up.name}"
-                   + (f" · speakers: {', '.join(ss.speakers)}" if ss.speakers else ""))
+                   + (f" · speakers: {', '.join(ss.speakers)}" if ss.speakers else "")
+                   + " — Q&A rows on one line were auto-split into Questioner + Pujyashree segments.")
+
+    vup = st.file_uploader(
+        "Optional: attach the ORIGINAL video → Step 5 can output a dubbed VIDEO",
+        type=["mp4", "mov", "mkv", "webm", "m4v"], key="import_video",
+    )
+    if vup and ss.get("import_video_sig") != vup.name:
+        p = run_dir / f"original{Path(vup.name).suffix}"
+        p.write_bytes(vup.getbuffer())
+        ss.video_path = str(p)
+        ss.import_video_sig = vup.name
+        try:
+            videoutils.check_ffmpeg()
+            ss.duration = max(float(ss.get("duration") or 0.0), videoutils.probe_duration_s(p))
+        except RuntimeError as exc:
+            st.error(str(exc))
+            st.code(videoutils.ffmpeg_python_hint())
+            st.stop()
+        st.success("🎬 Video attached. Dub timing follows your sheet's Time From/Time To — "
+                   "make sure those times match this video's audio.")
 
 ready = bool(ss.get("audio_wav")) or bool(ss.get("imported"))
 segs = ss.get("segments")
@@ -317,18 +352,31 @@ if ready:
     else:
         st.header("2️⃣ Transcribe (review & fix)")
         if st.button("🗣️ Start transcription (runs in background)", type="primary"):
-            def _transcribe_job(cb):
-                rot = KeyRotator(list(keys))
+            job_args = dict(
+                audio_path=str(ss.audio_wav), work_dir=str(run_dir), run_id=ss.run_id,
+                keys=list(keys), model=asr_model, src=source_language, max_chunk=max_chunk,
+            )
+
+            def _transcribe_job(cb, a=job_args):
+                cb(0.01, "Splitting audio into chunks…")
+                rot = KeyRotator(list(a["keys"]))
                 out = asr.transcribe_full(
-                    ss.audio_wav, str(run_dir), rot, model=asr_model,
-                    source_language=source_language, max_chunk_s=max_chunk,
+                    a["audio_path"], a["work_dir"], rot, model=a["model"],
+                    source_language=a["src"], max_chunk_s=a["max_chunk"],
                     progress_cb=cb,
                 )
-                store.save_segments(ss.run_id, out)
+                store.save_segments(a["run_id"], out)
                 return {"count": len(out)}
+
             store.job_start(ss.run_id, "transcribe", _transcribe_job)
-            poll_job("transcribe", "Transcribing")
+            res = poll_job("transcribe", "Transcribing")
             refresh_from_store()
+            if res is None:
+                st.stop()
+            if int(res.get("count", 0)) == 0:
+                st.error("⚠️ Transcription returned NO speech — check the audio actually "
+                         "contains speech (try a short loud clip to test first).")
+                st.stop()
             st.rerun()
         st.caption("Safe to switch tabs — the job keeps running server-side and saves to this project.")
 
@@ -387,10 +435,10 @@ if ready and segs:
                     + ", ".join(str(i + 1) for i in rep["identical"][:20]))
 
 # ------------------------------------------------------------------ step 3
-def _translate_job_factory(only_missing: bool):
+def _translate_job_factory(only_missing: bool, a: dict):
     def _job(cb):
-        rot = KeyRotator(list(keys))
-        segs = store.load_segments(ss.run_id) or ss.segments
+        rot = KeyRotator(list(a["keys"]))
+        segs = [dict(s) for s in (store.load_segments(a["run_id"]) or a["segments"])]
         if only_missing:
             idxs = [i for i, s in enumerate(segs)
                     if not str(s.get("translated") or "").strip()
@@ -399,32 +447,39 @@ def _translate_job_factory(only_missing: bool):
                 return {"translated": 0}
             subset = [segs[i] for i in idxs]
             out = translate.translate_segments(
-                subset, target_language, rot, model=translate_model,
-                source_language=source_language, progress_cb=cb)
+                subset, a["target"], rot, model=a["model"],
+                source_language=a["src"], progress_cb=cb)
             for i, row in zip(idxs, out):
                 segs[i]["translated"] = row["translated"]
             translated_n = len(out)
         else:
             segs = translate.translate_segments(
-                segs, target_language, rot, model=translate_model,
-                source_language=source_language, progress_cb=cb)
+                segs, a["target"], rot, model=a["model"],
+                source_language=a["src"], progress_cb=cb)
             translated_n = len(segs)
-        store.save_segments(ss.run_id, segs)
+        store.save_segments(a["run_id"], segs)
         return {"translated": translated_n}
     return _job
 
 if ready and segs:
     st.header("3️⃣ Translate")
+    _t_args = dict(run_id=ss.run_id, keys=list(keys), target=target_language,
+                   model=translate_model, src=source_language,
+                   segments=[dict(s) for s in ss.segments])
     c1, c2 = st.columns([1, 1])
     if c1.button(f"🌍 Translate ALL to {target_language}", type="primary"):
-        store.job_start(ss.run_id, "translate", _translate_job_factory(False))
-        poll_job("translate", "Translating")
+        store.job_start(ss.run_id, "translate", _translate_job_factory(False, _t_args))
+        res = poll_job("translate", "Translating")
         refresh_from_store()
+        if res is None:
+            st.stop()
         st.rerun()
     if c2.button("🩹 Translate only missing/identical rows"):
-        store.job_start(ss.run_id, "translate", _translate_job_factory(True))
-        poll_job("translate", "Translating missing rows")
+        store.job_start(ss.run_id, "translate", _translate_job_factory(True, _t_args))
+        res = poll_job("translate", "Translating missing rows")
         refresh_from_store()
+        if res is None:
+            st.stop()
         st.rerun()
 
     if any(s.get("translated") for s in ss.segments):
@@ -453,27 +508,37 @@ if ready and any(s.get("translated") for s in ss.get("segments") or []):
     st.caption("⏳ ~2–4 min per 5 min of content. Runs in background — safe to leave and come back.")
     if st.button("🎙️ Start voicing & alignment (background)", type="primary"):
         sp_map = dict(speaker_voices) if dual_voices else None
+        _v_args = dict(
+            run_id=ss.run_id, work_dir=str(run_dir),
+            keys=list(keys) if engine == "gemini" else [],
+            engine=engine, voice=voice, fallback=edge_fallback, sp_map=sp_map,
+            duration=ss.duration, segments=[dict(s) for s in ss.segments],
+            pacing=pacing_mode,
+        )
 
-        def _voice_job(cb):
-            rot = KeyRotator(list(keys)) if engine == "gemini" else None
-            segs = store.load_segments(ss.run_id) or ss.segments
+        def _voice_job(cb, a=_v_args):
+            rot = KeyRotator(list(a["keys"])) if a["keys"] else None
+            run_p = Path(a["work_dir"])
             voiced = tts.synthesize_track(
-                segs, run_dir / "voice_segments",
-                engine=engine, voice=voice, rotator=rot,
-                edge_fallback_voice=edge_fallback,
-                speaker_voices=sp_map,
+                a["segments"], run_p / "voice_segments",
+                engine=a["engine"], voice=a["voice"], rotator=rot,
+                edge_fallback_voice=a["fallback"],
+                speaker_voices=a["sp_map"],
                 progress_cb=lambda p, m: cb(0.8 * p, m),
             )
             track = align.build_track(
-                voiced, ss.duration, run_dir / "dubbed.wav",
-                run_dir / "stretch_tmp",
+                voiced, a["duration"], run_p / "dubbed.wav",
+                run_p / "stretch_tmp",
                 progress_cb=lambda p, m: cb(0.8 + 0.2 * p, m),
+                mode=a["pacing"],
             )
             return {"track": str(track)}
 
         store.job_start(ss.run_id, "voice", _voice_job)
-        poll_job("voice", "Voicing")
+        res = poll_job("voice", "Voicing")
         refresh_from_store()
+        if res is None:
+            st.stop()
         st.rerun()
 
     if ss.get("track_wav") and Path(ss.track_wav).exists():
@@ -493,7 +558,7 @@ if ready and ss.get("track_wav") and Path(ss.track_wav).exists():
     st.download_button(f"⬇️ Subtitles (SRT): {target_language}", (run_dir / "dub.srt").read_bytes(),
                        file_name="dub.srt", key="dl_srt_dub")
 
-    if mode == "🎬 Video" and ss.get("video_path") and Path(ss.video_path).exists():
+    if ss.get("video_path") and Path(ss.video_path).exists():
         if st.button("▶️ Build dubbed video + lip-sync package", type="primary"):
             with st.spinner("Muxing video…"):
                 dubbed = videoutils.mux_audio_video(
@@ -531,19 +596,24 @@ if ready and ss.get("track_wav") and Path(ss.track_wav).exists():
         st.subheader("📝 Optional: subtitled version (no Colab needed)")
         st.caption("Burns translated subtitles into the dubbed video. Good for long videos.")
         if st.button("Create subtitled video (background)"):
-            def _subtitle_job(cb):
-                cb(0.1, "rendering…")
-                out = videoutils.burn_subtitles(
-                    ss.dubbed_video, run_dir / "dub.srt",
-                    run_dir / f"dubbed_{target_language.lower()}_subtitled.mp4")
-                cb(1.0, "done")
-                return {"video": str(out)}
             if not ss.get("dubbed_video"):
                 st.warning("Build the dubbed video first (button above).")
             else:
+                _s_args = dict(video=str(ss.dubbed_video),
+                               srt=str(run_dir / "dub.srt"),
+                               out=str(run_dir / f"dubbed_{target_language.lower()}_subtitled.mp4"))
+
+                def _subtitle_job(cb, a=_s_args):
+                    cb(0.1, "rendering…")
+                    out = videoutils.burn_subtitles(a["video"], a["srt"], a["out"])
+                    cb(1.0, "done")
+                    return {"video": str(out)}
+
                 store.job_start(ss.run_id, "subtitle", _subtitle_job)
-                poll_job("subtitle", "Subtitles")
+                res = poll_job("subtitle", "Subtitles")
                 refresh_from_store()
+                if res is None:
+                    st.stop()
         if store.job_result(ss.run_id, "subtitle"):
             subbed = store.job_result(ss.run_id, "subtitle").get("video")
             if subbed and Path(subbed).exists():
