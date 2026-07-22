@@ -99,37 +99,45 @@ def import_transcript(data: bytes, filename: str) -> list[dict]:
 
     segments = []
     for _, row in df.iterrows():
-        speaker = str(row.get(c_speaker, "") or "").strip() if c_speaker else ""
         qtext = str(row.get(c_q, "") or "").strip() if c_q else ""
         mtext = str(row.get(c_m, "") or "").strip() if c_m else ""
         if qtext.lower() in ("nan", "none"):
             qtext = ""
         if mtext.lower() in ("nan", "none"):
             mtext = ""
-        if speaker.lower() in ("nan", "none"):
-            speaker = ""
-
-        texts = [t for t in (qtext, mtext) if t]
-        if not texts:
+        if not qtext and not mtext:
             continue
-        text = " ".join(texts)
-        if not speaker:
-            if c_q and qtext and not mtext:
-                speaker = "Questioner"
-            elif c_m and mtext and not qtext:
-                speaker = "Pujyashree"
 
         start = parse_time(row.get(c_from)) if c_from else None
         end = parse_time(row.get(c_to)) if c_to else None
         if start is None:
             continue
         if end is None or end <= start:
-            end = start + max(2.0, min(12.0, len(text) / 12.0))  # fall back estimate
+            end = start + max(2.0, min(15.0, (len(qtext) + len(mtext)) / 12.0))
 
-        segments.append({
-            "start": round(float(start), 3), "end": round(float(end), 3),
-            "text": text, "speaker": speaker or "",
-        })
+        # Speaker comes from WHICH column the text is in (ground truth):
+        #   Questions -> Questioner, Matter -> Pujyashree.
+        # Rows containing BOTH (Q&A on one line) are SPLIT into two segments,
+        # dividing the time range proportionally to the text lengths.
+        parts: list[tuple[str, str, float, float]] = []
+        if qtext and mtext:
+            span = end - start
+            ratio = len(qtext) / max(len(qtext) + len(mtext), 1)
+            mid = start + min(max(span * ratio, 1.0), span - 1.0) if span > 2 else start + span / 2
+            parts.append(("Questioner", qtext, start, mid))
+            parts.append(("Pujyashree", mtext, mid, end))
+        elif qtext:
+            parts.append(("Questioner", qtext, start, end))
+        else:
+            parts.append(("Pujyashree", mtext, start, end))
+
+        for role, text, ps, pe in parts:
+            if pe <= ps:
+                pe = ps + 1.0
+            segments.append({
+                "start": round(ps, 3), "end": round(pe, 3),
+                "text": text, "speaker": role,
+            })
 
     if not segments:
         raise ValueError("No usable rows found in the file.")

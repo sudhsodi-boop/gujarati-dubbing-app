@@ -14,10 +14,10 @@ TRANSLATE_MODEL = "gemini-2.5-flash"
 
 _PROMPT = """You are localizing a video. Translate each segment below from {src} into NATURAL, SPOKEN {dst}.
 
-Input JSON: [{{"id": <int>, "seconds": <float>, "text": "<src text>"}}, ...]
+Input JSON: [{{"id": <int>, "seconds": <float>, "max_chars": <int>, "text": "<src text>"}}, ...]
 
 Rules:
-- The translation of each segment must be speakable aloud in about the same number of seconds given (this is a dub — brevity matters).
+- STRICT LENGTH: each translation MUST be comfortably speakable aloud within its "seconds" — never exceed its "max_chars" character count. If a literal translation is too long, shorten and paraphrase naturally (this is a dub, not a document).
 - Use simple, conversational language (how a person would actually say it), not literal word-for-word translation.
 - Keep names, brands, numbers and facts accurate.
 - Return ONLY a JSON array: [{{"id": <int>, "text": "<translation>"}}, ...] with one entry per input id, in order.
@@ -41,6 +41,7 @@ def translate_segments(
         {
             "id": i,
             "seconds": round(seg["end"] - seg["start"], 2),
+            "max_chars": max(10, int(round((seg["end"] - seg["start"]) * 15))),
             "text": seg["text"],
         }
         for i, seg in enumerate(segments)
