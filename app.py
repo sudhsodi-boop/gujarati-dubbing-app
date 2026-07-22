@@ -137,6 +137,8 @@ with st.sidebar:
     )
     keys = load_keys_from_text(keys_text)
     st.caption(f"🔑 {len(keys)} key(s) loaded" if keys else "🔑 No keys yet")
+    if keys:
+        st.caption("⚡ Quota multiplies only if keys come from **different Google projects** — in AI Studio use “Create API key in new project”.")
 
     mode = st.radio("Input type", ["🎬 Video", "🎵 Audio", "📄 Import transcript (Excel/CSV)"], key="mode")
 
@@ -148,6 +150,20 @@ with st.sidebar:
             "gemini": "Gemini 2.5 TTS (uses your keys; falls back to Edge)",
         }[e],
     )
+
+    exhausted_policy = "fallback"
+    if engine == "gemini":
+        exhausted_policy = st.radio(
+            "If ALL keys run out mid-dub",
+            ["wait", "ask", "fallback"],
+            index=0,
+            format_func=lambda p: {
+                "wait": "⏳ Wait for keys to recover — never change voice (recommended)",
+                "ask": "❓ Wait, but ask me if it takes >3 min (standard voice?)",
+                "fallback": "⚡ Switch to gender-matched standard voice immediately",
+            }[p],
+        )
+        st.caption("Dubbing never skips a line — it only decides WHO voices it while keys cool.")
 
     pacing = st.radio(
         "Speech pacing",
@@ -193,7 +209,13 @@ with st.sidebar:
             format_func=lambda x: f"{edge_opts[x]}",
             key=f"voice_edge_{target_language}",
         )
-    edge_fallback = edge_voice_list[0]
+    # gender-matched fallback: if Gemini quota dies mid-dub, the Edge voice
+    # that takes over must match the gender of the voice you picked
+    if engine == "gemini" and voice:
+        gender = "F" if tts.GEMINI_VOICES.get(voice, "").startswith("Female") else "M"
+        edge_fallback = tts.pick_edge_fallback(target_language, gender)
+    else:
+        edge_fallback = edge_voice_list[0]
 
     with st.expander("Advanced"):
         source_language = st.text_input("Source language", "Gujarati")
@@ -255,9 +277,24 @@ st.info(f"📁 Current project: **{ss.run_id}** — progress is saved automatica
 for _kind, _label in (("transcribe", "Transcription"), ("translate", "Translation"),
                       ("voice", "Voicing"), ("subtitle", "Subtitles")):
     if store.job_running(ss.run_id, _kind):
-        poll_job(_kind, _label)
-        refresh_from_store()
-        st.rerun()
+        _asking = (_kind == "voice"
+                   and store.get_flag(ss.run_id, "ask_fallback")
+                   and not store.get_flag(ss.run_id, "fallback_decision"))
+        if _asking:
+            st.warning("⏳ All Gemini keys have been cooling for a while. "
+                       "What should I do for the remaining lines?")
+            c1, c2 = st.columns(2)
+            if c1.button("⏳ Keep waiting for Gemini keys", key="ask_wait"):
+                store.set_flag(ss.run_id, "fallback_decision", "wait")
+                st.rerun()
+            if c2.button("🗣️ Use the standard voice for the rest", key="ask_std"):
+                store.set_flag(ss.run_id, "fallback_decision", "standard")
+                st.rerun()
+            st.caption("(The dub is PAUSED, nothing is lost — your choice resumes it instantly.)")
+        else:
+            poll_job(_kind, _label)
+            refresh_from_store()
+            st.rerun()
 
 # ------------------------------------------------------------------ step 1
 st.header("1️⃣ Input")
@@ -513,32 +550,59 @@ if ready and any(s.get("translated") for s in ss.get("segments") or []):
             keys=list(keys) if engine == "gemini" else [],
             engine=engine, voice=voice, fallback=edge_fallback, sp_map=sp_map,
             duration=ss.duration, segments=[dict(s) for s in ss.segments],
-            pacing=pacing_mode,
+            pacing=pacing_mode, policy=exhausted_policy,
         )
 
         def _voice_job(cb, a=_v_args):
             rot = KeyRotator(list(a["keys"])) if a["keys"] else None
             run_p = Path(a["work_dir"])
+            store.set_flag(a["run_id"], "ask_fallback", False)
+            store.set_flag(a["run_id"], "fallback_decision", None)
+            interaction = {
+                "threshold_s": 180.0,
+                "set_ask": lambda b: store.set_flag(a["run_id"], "ask_fallback", b),
+                "decision": lambda: store.get_flag(a["run_id"], "fallback_decision"),
+            }
             voiced = tts.synthesize_track(
                 a["segments"], run_p / "voice_segments",
                 engine=a["engine"], voice=a["voice"], rotator=rot,
                 edge_fallback_voice=a["fallback"],
                 speaker_voices=a["sp_map"],
+                exhausted_policy=a["policy"], interaction=interaction,
                 progress_cb=lambda p, m: cb(0.8 * p, m),
             )
+            store.set_flag(a["run_id"], "ask_fallback", False)
+            store.set_flag(a["run_id"], "fallback_decision", None)
             track = align.build_track(
                 voiced, a["duration"], run_p / "dubbed.wav",
                 run_p / "stretch_tmp",
                 progress_cb=lambda p, m: cb(0.8 + 0.2 * p, m),
                 mode=a["pacing"],
             )
-            return {"track": str(track)}
+            counts = {"gemini": 0, "edge": 0}
+            for r in voiced:
+                if r.get("engine") in counts:
+                    counts[r["engine"]] += 1
+            return {
+                "track": str(track), **counts,
+                "key_usage": rot.stats() if rot else {},
+            }
 
         store.job_start(ss.run_id, "voice", _voice_job)
         res = poll_job("voice", "Voicing")
         refresh_from_store()
         if res is None:
             st.stop()
+        if res.get("key_usage"):
+            st.caption("🔑 Key rotation stats: " + ", ".join(
+                f"{k} → {v} calls" for k, v in res["key_usage"].items()))
+        if engine == "gemini" and res.get("edge"):
+            st.info(
+                f"ℹ️ {res['edge']} of {res.get('gemini', 0) + res.get('edge', 0)} segments "
+                f"temporarily used the gender-matched Edge backup while ALL Gemini keys were "
+                f"cooling down (rotation then resumed automatically). Add more keys from "
+                f"DIFFERENT projects to shrink this."
+            )
         st.rerun()
 
     if ss.get("track_wav") and Path(ss.track_wav).exists():
