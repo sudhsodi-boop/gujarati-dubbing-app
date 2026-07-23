@@ -120,6 +120,7 @@ def synth_edge(
     voice: str,
     out_wav: str | Path,
     rate_pct: int = 0,
+    max_retries: int = 3,
 ) -> Path:
     import edge_tts
 
@@ -128,16 +129,28 @@ def synth_edge(
     tmp_mp3 = out_wav.with_suffix(".tmp.mp3")
     rate = f"{rate_pct:+d}%"
 
-    async def _go():
-        communicate = edge_tts.Communicate(text=text, voice=voice, rate=rate)
-        await communicate.save(str(tmp_mp3))
+    last_exc = None
+    for attempt in range(max_retries):
+        try:
+            async def _go():
+                communicate = edge_tts.Communicate(text=text, voice=voice, rate=rate)
+                await communicate.save(str(tmp_mp3))
 
-    asyncio.run(_go())
-    seg = AudioSegment.from_mp3(str(tmp_mp3))
-    seg = seg.set_frame_rate(TTS_SAMPLE_RATE).set_channels(1).set_sample_width(2)
-    seg.export(str(out_wav), format="wav")
-    tmp_mp3.unlink(missing_ok=True)
-    return out_wav
+            asyncio.run(_go())
+            seg = AudioSegment.from_mp3(str(tmp_mp3))
+            seg = seg.set_frame_rate(TTS_SAMPLE_RATE).set_channels(1).set_sample_width(2)
+            seg.export(str(out_wav), format="wav")
+            tmp_mp3.unlink(missing_ok=True)
+            return out_wav
+        except Exception as exc:
+            last_exc = exc
+            if attempt < max_retries - 1:
+                wait = (attempt + 1) * 3  # 3s, 6s, 9s
+                if "NoAudioReceived" in str(exc) or "timeout" in str(exc).lower():
+                    time.sleep(wait)
+                    continue
+            raise
+    raise RuntimeError(f"Edge TTS failed after {max_retries} attempts: {last_exc}")
 
 
 # ------------------------------------------------------------------- per segment
