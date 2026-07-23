@@ -8,6 +8,7 @@ on disk in ./runs so you can resume and download later.
 
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import sys
@@ -123,6 +124,19 @@ def refresh_from_store():
     orig = sorted(Path(get_run_dir()).glob("original.*"))
     if orig:
         ss.video_path = str(orig[0])
+    # --- RESTORE audio_wav & duration for resume ---
+    src_wav = Path(get_run_dir()) / "source.wav"
+    if src_wav.exists():
+        ss.audio_wav = str(src_wav)
+    # duration from metadata
+    meta_p = Path(get_run_dir()) / "run.json"
+    if meta_p.exists():
+        try:
+            meta = json.loads(meta_p.read_text(encoding="utf-8"))
+            if meta.get("duration"):
+                ss.duration = meta["duration"]
+        except Exception:
+            pass
 
 
 # ---------------------------------------------------------------- run bootstrap
