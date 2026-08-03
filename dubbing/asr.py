@@ -24,7 +24,7 @@ from pydub import AudioSegment, silence
 
 from .keys import KeyRotator
 
-ASR_MODEL = "gemini-2.5-flash-001"
+ASR_MODEL = "gemini-2.0-flash"
 
 _ASR_PROMPT = """You are transcribing Gujarati (ગુજરાતી) speech for a video dubbing pipeline.
 
