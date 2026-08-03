@@ -55,6 +55,9 @@ def save_meta(run_id: str, **fields) -> None:
     p.write_text(json.dumps(meta, ensure_ascii=False, indent=1), encoding="utf-8")
 
 
+def prune_runs(keep=3):
+    ...
+
 def list_runs() -> list[dict]:
     out = []
     if ROOT.exists():
